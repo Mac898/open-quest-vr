@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 02/16] dt-bindings: misc: Add Oculus Quest 2 syncboss MCU
+
+The Oculus Quest 2 has an nRF52832 microcontroller, called "syncboss" by
+the vendor, that multiplexes the IMU, magnetometer, controller radio and
+proximity sensor onto one SPI link. The host frames fixed-length
+transactions and starts one whenever the MCU raises its ready line.
+
+Describe the SPI link: the ready interrupt and GPIO, the reset GPIO and
+the three supplies. The binding deliberately has no child nodes and does
+not describe the MCU's SWD programming interface.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ .../misc/oculus,hollywood-syncboss.yaml       | 92 +++++++++++++++++++
+ 1 file changed, 92 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/misc/oculus,hollywood-syncboss.yaml
+
+diff --git a/Documentation/devicetree/bindings/misc/oculus,hollywood-syncboss.yaml b/Documentation/devicetree/bindings/misc/oculus,hollywood-syncboss.yaml
+new file mode 100644
+index 000000000..c14f159a3
+--- /dev/null
++++ b/Documentation/devicetree/bindings/misc/oculus,hollywood-syncboss.yaml
+@@ -0,0 +1,92 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/misc/oculus,hollywood-syncboss.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Oculus Quest 2 syncboss sensor-hub MCU (SPI link)
++
++maintainers:
++  - mac <xmachd@gmail.com>
++
++description:
++  nRF52832 microcontroller on the Oculus Quest 2 ("hollywood") that
++  multiplexes the IMU, magnetometer, controller radio and proximity sensor
++  onto one SPI link. The host frames fixed-length transactions and starts one
++  when the MCU raises its ready line. This binding has no child nodes; in
++  particular it does not describe the MCU's SWD programming interface.
++
++allOf:
++  - $ref: /schemas/spi/spi-peripheral-props.yaml#
++
++properties:
++  compatible:
++    const: oculus,hollywood-syncboss
++
++  reg:
++    maxItems: 1
++
++  spi-max-frequency:
++    maximum: 8000000
++
++  spi-cpol: true
++  spi-cpha: true
++
++  interrupts:
++    maxItems: 1
++    description: MCU ready / data-ready line, rising edge.
++
++  reset-gpios:
++    maxItems: 1
++    description: MCU reset, active low.
++
++  ready-gpios:
++    maxItems: 1
++    description: MCU ready line, high while the MCU is awake.
++
++  vdd-supply:
++    description: MCU 1.8 V supply.
++
++  imu-supply:
++    description: IMU supply.
++
++  mag-supply:
++    description: Magnetometer supply.
++
++required:
++  - compatible
++  - reg
++  - spi-cpol
++  - spi-cpha
++  - interrupts
++  - reset-gpios
++  - ready-gpios
++  - vdd-supply
++  - imu-supply
++  - mag-supply
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    spi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        mcu@0 {
++            compatible = "oculus,hollywood-syncboss";
++            reg = <0>;
++            spi-max-frequency = <8000000>;
++            spi-cpol;
++            spi-cpha;
++            interrupts-extended = <&tlmm 4 IRQ_TYPE_EDGE_RISING>;
++            reset-gpios = <&tlmm 5 GPIO_ACTIVE_LOW>;
++            ready-gpios = <&tlmm 4 GPIO_ACTIVE_HIGH>;
++            vdd-supply = <&vreg_s4a_1p8>;
++            imu-supply = <&vreg_l7c_3p0>;
++            mag-supply = <&vreg_l8c_1p8>;
++        };
++    };

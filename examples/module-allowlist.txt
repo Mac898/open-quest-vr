@@ -1,0 +1,45 @@
+# Example module allowlist for `tools/dev mod-load LABEL --allow FILE` and `tools/dev mod-unload`.
+#
+# Format, one entry per line (blank lines and # comments are ignored):
+#
+#   release REL
+#       Exactly one. REL must equal `uname -r` of the running kernel and name the
+#       lib/modules/REL tree that `tools/dev mod-fetch REL --sha SHA256` unpacked.
+#
+#   LABEL kernel/<dir>/<name>.ko sha256:<64 hex> [param=value ...] [loaded:MODULE ...] [bound:DEVICE ...]
+#       LABEL            the name you pass to mod-load / mod-unload (lowercase, digits, _ + . -)
+#       kernel/....ko    path of the module below lib/modules/REL
+#       sha256:HEX       REQUIRED pin of the .ko; the device re-checks it right before the insmod
+#       param=value      module parameters, passed on the insmod line and nothing else (loadable
+#                        modules do not see kernel command-line parameters)
+#       loaded:MODULE    precondition: MODULE is in /proc/modules (a dependency loaded first)
+#       bound:DEVICE     precondition: /sys/bus/platform/devices/DEVICE/driver exists
+#
+#   Dependencies are listed as their own labels and loaded one by one, in order: there is no
+#   modprobe on the device, so nothing is ever autoloaded. Several labels may name the same .ko
+#   with different parameters (see msm / msm-zappre).
+#   Modules whose name matches the MOD_DENY list in tools/dev (PMIC SDAM, secure QFPROM, charger,
+#   fuel gauge, reboot-mode, spidev, syncboss, ...) are refused here whatever the file says.
+#
+# This file is the GPU-path module set of the mainline kernel (Adreno 650 / msm DRM), in load
+# order. The release and every sha256 below are PLACEHOLDERS: copy this file, set `release`, and
+# replace each hash with `sha256sum lib/modules/REL/kernel/.../X.ko` of your own build.
+#   tools/dev mod-fetch 6.18.0-example --sha <sha256 of modules-6.18.0-example.tar.gz>
+#   tools/dev mod-load gpucc --allow examples/module-allowlist.txt
+#   tools/dev mod-load msm   --allow examples/module-allowlist.txt
+#   tools/dev mod-unload msm --allow examples/module-allowlist.txt
+release 6.18.0-example
+gpucc kernel/drivers/clk/qcom/gpucc-sm8250.ko sha256:0101010101010101010101010101010101010101010101010101010101010101
+arm-smmu kernel/drivers/iommu/arm/arm-smmu/arm_smmu.ko sha256:0202020202020202020202020202020202020202020202020202020202020202 loaded:gpucc_sm8250
+backlight kernel/drivers/video/backlight/backlight.ko sha256:0303030303030303030303030303030303030303030303030303030303030303
+drm-pok kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko sha256:0404040404040404040404040404040404040404040404040404040404040404
+drm kernel/drivers/gpu/drm/drm.ko sha256:0505050505050505050505050505050505050505050505050505050505050505
+gpu-sched kernel/drivers/gpu/drm/scheduler/gpu-sched.ko sha256:0606060606060606060606060606060606060606060606060606060606060606
+drm-exec kernel/drivers/gpu/drm/drm_exec.ko sha256:0707070707070707070707070707070707070707070707070707070707070707
+drm-gpuvm kernel/drivers/gpu/drm/drm_gpuvm.ko sha256:0808080808080808080808080808080808080808080808080808080808080808
+ocmem kernel/drivers/soc/qcom/ocmem.ko sha256:0909090909090909090909090909090909090909090909090909090909090909
+mdt-loader kernel/drivers/soc/qcom/mdt_loader.ko sha256:0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a
+ubwc-config kernel/drivers/soc/qcom/ubwc_config.ko sha256:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b
+msm kernel/drivers/gpu/drm/msm/msm.ko sha256:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c separate_gpu_kms=1 loaded:gpucc_sm8250 bound:3da0000.iommu
+# Alternative with the zap shader preloaded as firmware (the device refuses msm-zappre while msm is loaded): `mod-unload msm`, then `mod-load msm-zappre`.
+msm-zappre kernel/drivers/gpu/drm/msm/msm.ko sha256:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c separate_gpu_kms=1 zap_preloaded=1 loaded:gpucc_sm8250 bound:3da0000.iommu

@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 10/16] drm/msm/a6xx: Add zap_preloaded module parameter
+
+After a kexec from another OS (Android on the Oculus Quest 2), TZ may
+still hold a zap shader that OS loaded, and refuse to load it again.
+With zap_preloaded=1 the driver skips the SCM load and relies on that
+copy. The default keeps the normal load.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index d1eaa849b..37013b4b0 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1115,6 +1115,15 @@ static int a6xx_ucode_load(struct msm_gpu *gpu)
+ 	return 0;
+ }
+ 
++/*
++ * After a kexec from another OS (e.g. Android on the Oculus Quest 2), TZ may
++ * still hold a zap shader that OS loaded and refuse a second load.
++ * zap_preloaded=1 then skips the SCM load and relies on that copy.
++ */
++static bool zap_preloaded;
++MODULE_PARM_DESC(zap_preloaded, "Skip the SCM zap shader load and use the copy TZ already holds (0=load (default), 1=skip)");
++module_param(zap_preloaded, bool, 0400);
++
+ static int a6xx_zap_shader_init(struct msm_gpu *gpu)
+ {
+ 	static bool loaded;
+@@ -1123,6 +1132,13 @@ static int a6xx_zap_shader_init(struct msm_gpu *gpu)
+ 	if (loaded)
+ 		return 0;
+ 
++	if (zap_preloaded) {
++		dev_info(&gpu->pdev->dev,
++			 "zap_preloaded: no SCM zap load, using the TZ-resident zap shader\n");
++		loaded = true;
++		return 0;
++	}
++
+ 	ret = adreno_zap_shader_load(gpu, GPU_PAS_ID);
+ 
+ 	loaded = !ret;

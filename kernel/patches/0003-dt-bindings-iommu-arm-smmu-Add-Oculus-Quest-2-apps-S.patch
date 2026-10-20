@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 03/16] dt-bindings: iommu: arm,smmu: Add Oculus Quest 2 apps
+ SMMU inherit mode
+
+On the Oculus Quest 2 Linux is started by kexec from Android, with the
+apps MMU-500 still in use by Android's masters and the secure world.
+Add a compatible for a driver mode that keeps that state and never
+resets the SMMU. It is used without a generic MMU-500 compatible, so a
+driver without that mode does not bind the node.
+
+oculus,inherit-attach-sids lists the stream IDs that may attach.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ .../devicetree/bindings/iommu/arm,smmu.yaml       | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/iommu/arm,smmu.yaml b/Documentation/devicetree/bindings/iommu/arm,smmu.yaml
+index 89495f094..0759212a9 100644
+--- a/Documentation/devicetree/bindings/iommu/arm,smmu.yaml
++++ b/Documentation/devicetree/bindings/iommu/arm,smmu.yaml
+@@ -163,6 +163,11 @@ properties:
+           - arm,mmu-401
+           - arm,mmu-500
+           - cavium,smmu-v2
++      - description: Oculus Quest 2 (SM8250) apps MMU-500 left live by the
++          previous OS across kexec. The driver keeps its stream map and
++          context banks and never resets it, so the node carries no generic
++          MMU-500 compatible that another driver could bind and reset.
++        const: oculus,hollywood-apps-smmu-inherit
+ 
+   reg:
+     minItems: 1
+@@ -213,6 +218,16 @@ properties:
+       access to SMMU configuration registers. In this case non-secure aliases of
+       secure registers have to be used during SMMU configuration.
+ 
++  oculus,inherit-attach-sids:
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    minItems: 1
++    maxItems: 16
++    items:
++      maximum: 0x7fff
++    description:
++      Only for oculus,hollywood-apps-smmu-inherit. Stream IDs (mask 0) of the
++      masters that may attach. Without it no master attaches.
++
+   stream-match-mask:
+     $ref: /schemas/types.yaml#/definitions/uint32
+     description: |

@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 2/2] arm64: configs: Add Oculus Quest 2 diagnostic config
+ fragment
+
+Add quest2-diag.config, applied after quest2.config when debugging boot
+hangs: soft lockups, hung tasks and watchdog barks panic, and dynamic
+debug is built in. The boot beacon stays off.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ arch/arm64/configs/quest2-diag.config | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+ create mode 100644 arch/arm64/configs/quest2-diag.config
+
+diff --git a/arch/arm64/configs/quest2-diag.config b/arch/arm64/configs/quest2-diag.config
+new file mode 100644
+index 000000000..919094901
+--- /dev/null
++++ b/arch/arm64/configs/quest2-diag.config
+@@ -0,0 +1,25 @@
++# Oculus Quest 2: diagnostics for boot hangs, applied after quest2.config.
++#
++# The watchdog-timing boot beacon adds about 84 s to every boot.
++# CONFIG_QUEST2_DIAG_WDT_BEACON is not set
++
++# Panic on a soft lockup or a task blocked for 30 s; report hard lockups
++# (buddy detector, no NMI). These policies have to come from Kconfig, as
++# the sysctls are only applied once init runs. With
++# quest2_warm_reset.on_panic=1 the panic ends in a warm reset, so the log
++# survives in ramoops.
++CONFIG_SOFTLOCKUP_DETECTOR=y
++CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y
++CONFIG_HARDLOCKUP_DETECTOR=y
++# CONFIG_BOOTPARAM_HARDLOCKUP_PANIC is not set
++CONFIG_DETECT_HUNG_TASK=y
++CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=30
++CONFIG_BOOTPARAM_HUNG_TASK_PANIC=y
++# Panic on an APSS watchdog bark, 1 s before the bite
++CONFIG_WATCHDOG_PRETIMEOUT_GOV=y
++# CONFIG_WATCHDOG_PRETIMEOUT_GOV_NOOP is not set
++CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y
++CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_PANIC=y
++
++# dd.dyndbg=+p logs each driver probe before it runs
++CONFIG_DYNAMIC_DEBUG=y

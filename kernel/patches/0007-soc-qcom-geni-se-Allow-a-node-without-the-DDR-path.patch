@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 07/16] soc: qcom: geni-se: Allow a node without the DDR path
+
+geni_icc_get() fails when a node lists interconnects but not the DDR
+path. On the Oculus Quest 2 the QUP0 DDR path starts on a NoC that is
+left as Android set it up, while SE4 still needs its qup-core and
+qup-config votes. Leave the DDR path NULL in that case.
+
+Also warn when there is no qup-core path: a register access without a
+QUP core clock vote stalls the CPU.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ drivers/soc/qcom/qcom-geni-se.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/drivers/soc/qcom/qcom-geni-se.c b/drivers/soc/qcom/qcom-geni-se.c
+index 2fa6a4590..3f7b474f0 100644
+--- a/drivers/soc/qcom/qcom-geni-se.c
++++ b/drivers/soc/qcom/qcom-geni-se.c
+@@ -907,11 +907,33 @@ int geni_icc_get(struct geni_se *se, const char *icc_ddr)
+ 		if (!icc_names[i])
+ 			continue;
+ 
++		/*
++		 * A node may list only the register-access paths (qup-core,
++		 * qup-config), e.g. when the NoC the DDR path starts on is left
++		 * to the previous OS after kexec. The DDR path then stays NULL.
++		 */
++		if (i == GENI_TO_DDR &&
++		    of_property_match_string(se->dev->of_node,
++					     "interconnect-names",
++					     icc_names[i]) < 0) {
++			dev_info(se->dev, "no '%s' interconnect: no DDR vote\n",
++				 icc_names[i]);
++			continue;
++		}
++
+ 		se->icc_paths[i].path = devm_of_icc_get(se->dev, icc_names[i]);
+ 		if (IS_ERR(se->icc_paths[i].path))
+ 			goto err;
+ 	}
+ 
++	/*
++	 * Without a qup-core path nothing here votes the QUP core clock, and a
++	 * register access while no other master holds that vote stalls the CPU.
++	 */
++	if (!se->icc_paths[GENI_TO_CORE].path)
++		dev_warn(se->dev,
++			 "no qup-core interconnect: QUP core clock not voted\n");
++
+ 	return 0;
+ 
+ err:

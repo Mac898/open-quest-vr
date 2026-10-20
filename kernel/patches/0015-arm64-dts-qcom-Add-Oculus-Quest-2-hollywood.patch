@@ -1,0 +1,1334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 15/16] arm64: dts: qcom: Add Oculus Quest 2 (hollywood)
+
+Add the device tree for the Oculus Quest 2 (Qualcomm XR2 / SM8250).
+
+Linux is started from Android by kexec, using the quest-kexec boot
+loader (https://github.com/Mac898/quest-kexec), and much of the
+hardware is still in use by Android, the secure world and the remote
+processors. Only what this port drives is enabled: CPUs with cpufreq-hw
+and thermal trips, the fan and status LED, USB 2.0 peripheral, the
+battery gauge (read-only), the syncboss MCU, the warm reset, the apps
+SMMU in inherit mode, and the headless GPU nodes. The rest, including
+UFS, display, remote processors and the charger, is disabled, and
+unused TLMM pins are reserved.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/Makefile             |    1 +
+ .../boot/dts/qcom/sm8250-oculus-hollywood.dts | 1292 +++++++++++++++++
+ 2 files changed, 1293 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/qcom/sm8250-oculus-hollywood.dts
+
+diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
+index dffdb219f..220b37a55 100644
+--- a/arch/arm64/boot/dts/qcom/Makefile
++++ b/arch/arm64/boot/dts/qcom/Makefile
+@@ -281,6 +281,7 @@ dtb-$(CONFIG_ARCH_QCOM)	+= sm8150-sony-xperia-kumano-bahamut.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8150-sony-xperia-kumano-griffin.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-hdk.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-mtp.dtb
++dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-oculus-hollywood.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-r8q.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-sony-xperia-edo-pdx203.dtb
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-oculus-hollywood.dts b/arch/arm64/boot/dts/qcom/sm8250-oculus-hollywood.dts
+new file mode 100644
+index 000000000..2870ce734
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8250-oculus-hollywood.dts
+@@ -0,0 +1,1292 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * Oculus Quest 2 ("hollywood"), Qualcomm XR2 / SM8250.
++ *
++ * Linux is started from the stock Android system by kexec. Android, the secure
++ * world and the remote processors keep much of the hardware running across that
++ * handoff, so only what this port drives is enabled and the rest is left as
++ * Android set it up.
++ */
++
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/leds/common.h>
++#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include "sm8250.dtsi"
++#include "pm8150.dtsi"
++#include "pm8150b.dtsi"
++#include "pm8150l.dtsi"
++
++/*
++ * Not reserved on this board: the vendor kernel uses this range as System RAM,
++ * and the kernel is loaded at 0x90000000.
++ */
++/delete-node/ &cdsp_secure_heap;
++
++/ {
++	model = "Oculus Quest 2 (hollywood)";
++	compatible = "oculus,hollywood", "qcom,sm8250";
++	chassis-type = "embedded";
++
++	/* bootargs and linux,initrd-* are filled in by the boot loader */
++	chosen { };
++
++	/* 6 GiB, as passed by the bootloader */
++	memory@80000000 {
++		device_type = "memory";
++		reg = <0x0 0x80000000 0x0 0x3cc00000>,
++		      <0x0 0xc0000000 0x0 0x80000000>,
++		      <0x1 0x40000000 0x0 0xc0000000>;
++	};
++
++	/*
++	 * All no-map, so that the no-map regions the boot loader adds at run
++	 * time may overlap them.
++	 */
++	reserved-memory {
++		xbl_uefi_log_mem: memory@80880000 {
++			reg = <0x0 0x80880000 0x0 0x14000>;
++			no-map;
++		};
++
++		/*
++		 * Android's ramoops region (0x9ba00000, 0x90000). The first
++		 * 256 KiB hold Android's dump records and the boot loader's RAM
++		 * log and are left alone; the console and pmsg zones are
++		 * reused.
++		 */
++		android_ramoops_dump_mem: memory@9ba00000 {
++			reg = <0x0 0x9ba00000 0x0 0x40000>;
++			no-map;
++		};
++
++		ramoops@9ba40000 {
++			compatible = "ramoops";
++			reg = <0x0 0x9ba40000 0x0 0x50000>;
++			record-size = <0x10000>;
++			console-size = <0x20000>;
++			pmsg-size = <0x20000>;
++			no-map;
++		};
++
++		/* Android's splash framebuffer; MDSS may still scan it out */
++		cont_splash_mem: memory@9c000000 {
++			reg = <0x0 0x9c000000 0x0 0x2300000>;
++			no-map;
++		};
++
++		dfps_data_mem: memory@9e300000 {
++			reg = <0x0 0x9e300000 0x0 0x100000>;
++			no-map;
++		};
++
++		/*
++		 * Android's DMA/CMA pools and mailbox region. The remote
++		 * processors and TZ keep running and may still DMA into them.
++		 */
++		android_dyn_pools_mem: memory@ec800000 {
++			reg = <0x0 0xec800000 0x0 0x13420000>;
++			no-map;
++		};
++	};
++
++	/*
++	 * The vendor kernel controls the fan speed in closed loop. pwm-fan uses
++	 * just two duty values, the vendor start value (84) and full speed, so
++	 * the fan never stops.
++	 */
++	fan: fan {
++		compatible = "pwm-fan";
++		pwms = <&pm8150l_lpg 4 40000>;
++		fan-supply = <&vreg_bob>;
++		interrupts-extended = <&tlmm 64 IRQ_TYPE_EDGE_RISING>;
++		pulses-per-revolution = <2>;
++		cooling-levels = <84 255>;
++		#cooling-cells = <2>;
++		/* Keep full speed across kexec and reboot */
++		fan-shutdown-percent = <100>;
++
++		pinctrl-0 = <&fan_pwm_default>, <&fan_tach_default>;
++		pinctrl-names = "default";
++	};
++
++	/*
++	 * CPU zones are also polled every 100 ms, as in the vendor DT, in case
++	 * a tsens interrupt is missed. Gold and prime sensors use the vendor
++	 * 90 C limits: 5 C hysteresis, up to 10 steps on the gold cluster and
++	 * 17 on the prime core.
++	 */
++	thermal-zones {
++		cpu0-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				cpu0_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map-fan {
++					trip = <&cpu0_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu1-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				cpu1_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map-fan {
++					trip = <&cpu1_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu2-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				cpu2_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map-fan {
++					trip = <&cpu2_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu3-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				cpu3_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map-fan {
++					trip = <&cpu3_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu4-top-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				trip-point0 {
++					hysteresis = <5000>;
++				};
++
++				cpu4_top_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					cooling-device = <&cpu4 0 10>;
++				};
++
++				map-fan {
++					trip = <&cpu4_top_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu5-top-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				trip-point0 {
++					hysteresis = <5000>;
++				};
++
++				cpu5_top_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					cooling-device = <&cpu4 0 10>;
++				};
++
++				map-fan {
++					trip = <&cpu5_top_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu6-top-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				trip-point0 {
++					hysteresis = <5000>;
++				};
++
++				cpu6_top_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					cooling-device = <&cpu4 0 10>;
++				};
++
++				map-fan {
++					trip = <&cpu6_top_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu7-top-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				trip-point0 {
++					hysteresis = <5000>;
++				};
++
++				cpu7_top_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					cooling-device = <&cpu7 0 17>;
++				};
++
++				map-fan {
++					trip = <&cpu7_top_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu4-bottom-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				trip-point0 {
++					hysteresis = <5000>;
++				};
++
++				cpu4_bottom_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					cooling-device = <&cpu4 0 10>;
++				};
++
++				map-fan {
++					trip = <&cpu4_bottom_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu5-bottom-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				trip-point0 {
++					hysteresis = <5000>;
++				};
++
++				cpu5_bottom_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					cooling-device = <&cpu4 0 10>;
++				};
++
++				map-fan {
++					trip = <&cpu5_bottom_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu6-bottom-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				trip-point0 {
++					hysteresis = <5000>;
++				};
++
++				cpu6_bottom_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					cooling-device = <&cpu4 0 10>;
++				};
++
++				map-fan {
++					trip = <&cpu6_bottom_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cpu7-bottom-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				trip-point0 {
++					hysteresis = <5000>;
++				};
++
++				cpu7_bottom_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					cooling-device = <&cpu7 0 17>;
++				};
++
++				map-fan {
++					trip = <&cpu7_bottom_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cluster0-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				cluster0_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map-fan {
++					trip = <&cluster0_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		cluster1-thermal {
++			polling-delay-passive = <100>;
++			polling-delay = <100>;
++
++			trips {
++				cluster1_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map-fan {
++					trip = <&cluster1_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		gpu-top-thermal {
++			trips {
++				gpu_top_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map-fan {
++					trip = <&gpu_top_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++		gpu-bottom-thermal {
++			trips {
++				gpu_bottom_fan: trip-fan {
++					temperature = <70000>;
++					hysteresis = <10000>;
++					type = "active";
++				};
++			};
++
++			cooling-maps {
++				map-fan {
++					trip = <&gpu_bottom_fan>;
++					cooling-device = <&fan 1 1>;
++				};
++			};
++		};
++
++	};
++};
++
++/*
++ * Only the rails used here, at the vendor voltages. The always-on rails are
++ * shared with blocks Linux does not drive (UFS PHY, DSI PHY, PD PHY).
++ *
++ * No power domain on the RSC: its provider, cpuidle-psci-domain, does not exist
++ * without CPU idle, so rpmh-rsc would never probe. Without one, rpmh-rsc relies
++ * on CPU PM notifiers, which nothing calls here, and sends active-only votes.
++ */
++&apps_rsc {
++	/delete-property/ power-domains;
++
++	regulators-0 {
++		compatible = "qcom,pm8150-rpmh-regulators";
++		qcom,pmic-id = "a";
++
++		vreg_l2a_3p072: ldo2 {
++			regulator-name = "vreg_l2a_3p072";
++			regulator-min-microvolt = <3072000>;
++			regulator-max-microvolt = <3072000>;
++			regulator-always-on;
++		};
++
++		vreg_l5a_0p88: ldo5 {
++			regulator-name = "vreg_l5a_0p88";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <880000>;
++			regulator-always-on;
++		};
++
++		vreg_l9a_1p2: ldo9 {
++			regulator-name = "vreg_l9a_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-always-on;
++		};
++
++		vreg_l12a_1p8: ldo12 {
++			regulator-name = "vreg_l12a_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-always-on;
++		};
++
++		/* vendor range 0.800-0.920 V; the SS PHY votes 0.912 V */
++		vreg_l18a_0p912: ldo18 {
++			regulator-name = "vreg_l18a_0p912";
++			regulator-min-microvolt = <912000>;
++			regulator-max-microvolt = <912000>;
++			regulator-always-on;
++		};
++
++		/* syncboss MCU; shared 1.8 V rail */
++		vreg_s4a_1p8: smps4 {
++			regulator-name = "vreg_s4a_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-always-on;
++		};
++	};
++
++	regulators-1 {
++		compatible = "qcom,pm8150l-rpmh-regulators";
++		qcom,pmic-id = "c";
++
++		/*
++		 * No voltage constraints: the regulator's 32 mV step cannot
++		 * express the 3.312 V Android set, and without them only the
++		 * enable is sent. BOB feeds other regulators.
++		 */
++		vreg_bob: bob {
++			regulator-name = "vreg_bob";
++			regulator-always-on;
++		};
++
++		/* syncboss IMU, switched by the driver */
++		vreg_l7c_3p0: ldo7 {
++			regulator-name = "vreg_l7c_3p0";
++			regulator-min-microvolt = <3000000>;
++			regulator-max-microvolt = <3000000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		/* syncboss magnetometer, switched by the driver */
++		vreg_l8c_1p8: ldo8 {
++			regulator-name = "vreg_l8c_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++/* &adreno_smmu and &gpucc stay enabled; their drivers are modules */
++
++&aoss_qmp {
++	status = "disabled";
++};
++
++&camcc {
++	status = "disabled";
++};
++
++&crypto {
++	status = "disabled";
++};
++
++&cryptobam {
++	status = "disabled";
++};
++
++&dispcc {
++	status = "disabled";
++};
++
++&ipcc {
++	status = "disabled";
++};
++
++&lpass_tlmm {
++	status = "disabled";
++};
++
++&vamacro {
++	status = "disabled";
++};
++
++&videocc {
++	status = "disabled";
++};
++
++&{/smp2p-adsp} {
++	status = "disabled";
++};
++
++&{/smp2p-cdsp} {
++	status = "disabled";
++};
++
++&{/smp2p-slpi} {
++	status = "disabled";
++};
++
++/* QDSS / coresight: clocked through AOSS QMP, which stays off */
++&{/soc@0/stm@6002000} {
++	status = "disabled";
++};
++
++&{/soc@0/tpda@6004000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@6005000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@6041000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@6042000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@6045000} {
++	status = "disabled";
++};
++
++&{/soc@0/replicator@6046000} {
++	status = "disabled";
++};
++
++&{/soc@0/etr@6048000} {
++	status = "disabled";
++};
++
++&{/soc@0/tpdm@684c000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@6b04000} {
++	status = "disabled";
++};
++
++&{/soc@0/etf@6b05000} {
++	status = "disabled";
++};
++
++&{/soc@0/replicator@6b06000} {
++	status = "disabled";
++};
++
++&{/soc@0/tpdm@6c08000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@6c0b000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@6c2d000} {
++	status = "disabled";
++};
++
++&{/soc@0/etm@7040000} {
++	status = "disabled";
++};
++
++&{/soc@0/etm@7140000} {
++	status = "disabled";
++};
++
++&{/soc@0/etm@7240000} {
++	status = "disabled";
++};
++
++&{/soc@0/etm@7340000} {
++	status = "disabled";
++};
++
++&{/soc@0/etm@7440000} {
++	status = "disabled";
++};
++
++&{/soc@0/etm@7540000} {
++	status = "disabled";
++};
++
++&{/soc@0/etm@7640000} {
++	status = "disabled";
++};
++
++&{/soc@0/etm@7740000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@7800000} {
++	status = "disabled";
++};
++
++&{/soc@0/funnel@7810000} {
++	status = "disabled";
++};
++
++/*
++ * Bound in inherit mode: the stream map and context banks set up by Android and
++ * the secure world are kept and the SMMU is never reset. The compatible
++ * replaces the generic ones so that no other driver binds the node.
++ *
++ * USB (stream 0x0) and the QUP2 wrapper (stream 0x63) take over their inherited
++ * entries and get new context banks; the banks they leave (CB15, CB7) stay
++ * reserved. Table walks are non-coherent, as Android set up.
++ */
++&apps_smmu {
++	compatible = "oculus,hollywood-apps-smmu-inherit";
++	oculus,inherit-attach-sids = <0x0 0x63>;
++	/delete-property/ dma-coherent;
++	status = "okay";
++};
++
++/*
++ * Only usb_1_dwc3 and qupv3_id_2 attach to apps_smmu. The storage streams are
++ * programmed by TZ.
++ */
++&ufs_mem_hc {
++	/delete-property/ iommus;
++};
++
++&sdhc_2 {
++	/delete-property/ iommus;
++};
++
++&gpi_dma0 {
++	/delete-property/ iommus;
++};
++
++&gpi_dma1 {
++	/delete-property/ iommus;
++};
++
++&gpi_dma2 {
++	/delete-property/ iommus;
++};
++
++&qupv3_id_1 {
++	/delete-property/ iommus;
++};
++
++&pcie0 {
++	/delete-property/ iommu-map;
++};
++
++&pcie1 {
++	/delete-property/ iommu-map;
++};
++
++&pcie2 {
++	/delete-property/ iommu-map;
++};
++
++&cryptobam {
++	/delete-property/ iommus;
++};
++
++&crypto {
++	/delete-property/ iommus;
++};
++
++&usb_2_dwc3 {
++	/delete-property/ iommus;
++};
++
++&venus {
++	/delete-property/ iommus;
++};
++
++&camss {
++	/delete-property/ iommus;
++};
++
++&mdss {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@17300000/glink-edge/apr/service@7/dais} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@5c00000/glink-edge/fastrpc/compute-cb@1} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@5c00000/glink-edge/fastrpc/compute-cb@2} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@5c00000/glink-edge/fastrpc/compute-cb@3} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@8300000/glink-edge/fastrpc/compute-cb@1} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@8300000/glink-edge/fastrpc/compute-cb@2} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@8300000/glink-edge/fastrpc/compute-cb@3} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@8300000/glink-edge/fastrpc/compute-cb@4} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@8300000/glink-edge/fastrpc/compute-cb@5} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@8300000/glink-edge/fastrpc/compute-cb@6} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@8300000/glink-edge/fastrpc/compute-cb@7} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@8300000/glink-edge/fastrpc/compute-cb@8} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@17300000/glink-edge/fastrpc/compute-cb@3} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@17300000/glink-edge/fastrpc/compute-cb@4} {
++	/delete-property/ iommus;
++};
++
++&{/soc@0/remoteproc@17300000/glink-edge/fastrpc/compute-cb@5} {
++	/delete-property/ iommus;
++};
++
++/*
++ * For the GPU zap shader and the adreno SMMU. Without qcom,dload-mode the
++ * download mode is left as it is.
++ */
++&{/firmware/scm} {
++	/delete-property/ qcom,dload-mode;
++	status = "okay";
++};
++
++/* No driver built (QCOM_LLCC=n); LLCC is configured by TZ/boot */
++&{/soc@0/system-cache-controller@9200000} {
++	status = "disabled";
++};
++
++/* The MMIO timer driver writes CNTACR; the arch timer is enough */
++&{/soc@0/timer@17c20000} {
++	status = "disabled";
++};
++
++/*
++ * For the GPU speed bin. With a single reg region the nvmem device is
++ * read-only. PRNG, TCSR and SMEM are not needed.
++ */
++&qfprom {
++	status = "okay";
++};
++
++&rng {
++	status = "disabled";
++};
++
++&tcsr {
++	status = "disabled";
++};
++
++&tcsr_mutex {
++	status = "disabled";
++};
++
++&{/smem} {
++	status = "disabled";
++};
++
++/* No driver built (QCOM_STATS=n, QCOM_ICC_BWMON=n) */
++&{/soc@0/sram@c3f0000} {
++	status = "disabled";
++};
++
++&{/soc@0/pmu@9091000} {
++	status = "disabled";
++};
++
++&{/soc@0/pmu@90b6400} {
++	status = "disabled";
++};
++
++/* CPU PMU: perf only, not needed */
++&{/pmu} {
++	status = "disabled";
++};
++
++/*
++ * No consumer here, and its sync_state would drop Android's MMCX/MX votes under
++ * the still running display.
++ */
++&rpmhpd {
++	status = "disabled";
++};
++
++/*
++ * OPPs come from the hardware LUT. Without operating-points-v2 the driver makes
++ * no L3 or DDR bandwidth votes, which stay as Android set them.
++ */
++&cpu0 {
++	/delete-property/ operating-points-v2;
++};
++
++&cpu1 {
++	/delete-property/ operating-points-v2;
++};
++
++&cpu2 {
++	/delete-property/ operating-points-v2;
++};
++
++&cpu3 {
++	/delete-property/ operating-points-v2;
++};
++
++&cpu4 {
++	/delete-property/ operating-points-v2;
++};
++
++&cpu5 {
++	/delete-property/ operating-points-v2;
++};
++
++&cpu6 {
++	/delete-property/ operating-points-v2;
++};
++
++&cpu7 {
++	/delete-property/ operating-points-v2;
++};
++
++&cpufreq_hw {
++	status = "okay";
++};
++
++&epss_l3 {
++	status = "disabled";
++};
++
++/*
++ * Headless Adreno 650. The zap shader must be the device-signed image from the
++ * headset; the linux-firmware one does not authenticate.
++ */
++&gmu {
++	status = "okay";
++};
++
++&gpu {
++	status = "okay";
++
++	zap-shader {
++		firmware-name = "qcom/sm8250/oculus/hollywood/a650_zap.mbn";
++	};
++};
++
++/* Not on the USB or QUP paths; their BCMs keep Android's votes */
++&aggre2_noc {
++	status = "disabled";
++};
++
++&compute_noc {
++	status = "disabled";
++};
++
++&mmss_noc {
++	status = "disabled";
++};
++
++&npu_noc {
++	status = "disabled";
++};
++
++/*
++ * The QUP0 BCM keeps the QUP core clocks running. Android drops that vote once
++ * its SEs are idle, and an SE register access without it stalls the CPU, so SE4
++ * and SE19 vote for it themselves.
++ */
++&qup_virt {
++	status = "okay";
++};
++
++/*
++ * PM8150 is enabled only as the SPMI regmap of the warm-reset node; its
++ * children stay disabled. PM8150B (charger) is not touched. On PM8150L only the
++ * GPIOs and the LPG are used.
++ */
++&pm8150_0 {
++	status = "okay";
++};
++
++&pon {
++	status = "disabled";
++};
++
++/* PS_HOLD warm reset back to Android */
++&{/soc@0} {
++	warm-reset@c264000 {
++		compatible = "oculus,hollywood-warm-reset";
++		reg = <0x0 0x0c264000 0x0 0x4>;
++		oculus,pon = <&pon>;
++		oculus,apss-wdt = <&{/soc@0/watchdog@17c10000}>;
++	};
++};
++
++&pm8150_temp {
++	status = "disabled";
++};
++
++&pm8150_adc {
++	status = "disabled";
++};
++
++&{/soc@0/spmi@c440000/pmic@0/rtc@6000} {
++	status = "disabled";
++};
++
++&pm8150_gpios {
++	status = "disabled";
++};
++
++&{/soc@0/spmi@c440000/pmic@1} {
++	status = "disabled";
++};
++
++&{/soc@0/spmi@c440000/pmic@2} {
++	status = "disabled";
++};
++
++&{/soc@0/spmi@c440000/pmic@3} {
++	status = "disabled";
++};
++
++&pm8150l_temp {
++	status = "disabled";
++};
++
++&pm8150l_adc {
++	status = "disabled";
++};
++
++&pm8150l_gpios {
++	fan_pwm_default: fan-pwm-default-state {
++		pins = "gpio10";
++		function = "func1";
++		output-low;
++		bias-disable;
++		power-source = <1>;
++		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
++		drive-push-pull;
++	};
++};
++
++/*
++ * Fan PWM on channel 5. The RGB status LED is on channels 1-3 through the
++ * TRILED block, as three single-colour LEDs so that the blue heartbeat runs
++ * independently of red and green.
++ */
++&pm8150l_lpg {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	status = "okay";
++
++	led@1 {
++		reg = <1>;
++		color = <LED_COLOR_ID_RED>;
++		function = LED_FUNCTION_STATUS;
++	};
++
++	led@2 {
++		reg = <2>;
++		color = <LED_COLOR_ID_GREEN>;
++		function = LED_FUNCTION_STATUS;
++	};
++
++	led@3 {
++		reg = <3>;
++		color = <LED_COLOR_ID_BLUE>;
++		function = LED_FUNCTION_HEARTBEAT;
++		linux,default-trigger = "heartbeat";
++	};
++};
++
++/*
++ * Mainline reads the configuration of every valid GPIO at registration, and an
++ * access to a TZ-owned pin is an XPU violation. The TZ-owned set is not known,
++ * so all pins are reserved except those the vendor kernel uses: gpio0-3 (SE19
++ * SPI), gpio4/5 (syncboss ready and reset), gpio8/9 (SE4 I2C) and gpio64 (fan
++ * tach).
++ */
++&tlmm {
++	gpio-reserved-ranges = <6 2>, <10 54>, <65 116>;
++
++	fan_tach_default: fan-tach-default-state {
++		pins = "gpio64";
++		function = "gpio";
++		drive-strength = <4>;
++		bias-pull-up;
++	};
++
++	syncboss_ready_default: syncboss-ready-default-state {
++		pins = "gpio4";
++		function = "gpio";
++		bias-pull-down;
++	};
++
++	syncboss_reset_default: syncboss-reset-default-state {
++		pins = "gpio5";
++		function = "gpio";
++		drive-strength = <6>;
++		output-low;
++	};
++};
++
++&qup_spi19_cs {
++	drive-strength = <6>;
++	bias-disable;
++};
++
++&qup_spi19_data_clk {
++	drive-strength = <6>;
++	bias-disable;
++};
++
++/*
++ * USB 2.0 only: the QMP combo PHY is left as Android set it up and dwc3 uses
++ * the UTMI clock as PIPE clock, like the other HS-only SM8250 boards.
++ */
++&usb_1 {
++	qcom,select-utmi-as-pipe-clk;
++
++	status = "okay";
++};
++
++&usb_1_dwc3 {
++	dr_mode = "peripheral";
++	maximum-speed = "high-speed";
++	phys = <&usb_1_hsphy>;
++	phy-names = "usb2-phy";
++};
++
++&usb_1_hsphy {
++	vdda-pll-supply = <&vreg_l5a_0p88>;
++	vdda18-supply = <&vreg_l12a_1p8>;
++	vdda33-supply = <&vreg_l2a_3p072>;
++
++	status = "okay";
++};
++
++/* SS PHY not used (HS only); left untouched */
++&usb_1_qmpphy {
++	vdda-phy-supply = <&vreg_l9a_1p2>;
++	vdda-pll-supply = <&vreg_l18a_0p912>;
++
++	status = "disabled";
++};
++
++/* SE4 only; the wrapper is not attached to the apps SMMU */
++&qupv3_id_0 {
++	/delete-property/ iommus;
++
++	status = "okay";
++};
++
++/*
++ * FIFO mode only. No qup-memory path: it starts on aggre2_noc, which stays
++ * disabled.
++ */
++&i2c4 {
++	clock-frequency = <100000>;
++	/delete-property/ dmas;
++	/delete-property/ dma-names;
++	/delete-property/ power-domains;
++	interconnects = <&qup_virt MASTER_QUP_CORE_0 0 &qup_virt SLAVE_QUP_CORE_0 0>,
++			<&gem_noc MASTER_AMPSS_M0 0 &config_noc SLAVE_QUP_0 0>;
++	interconnect-names = "qup-core",
++			     "qup-config";
++
++	status = "okay";
++
++	/*
++	 * No monitored-battery, so the driver never writes the gauge's data
++	 * memory
++	 */
++	fuel-gauge@55 {
++		compatible = "ti,bq27z561";
++		reg = <0x55>;
++	};
++};
++
++/*
++ * SE19 only. The wrapper (stream 0x63) is the SE DMA master and attaches to
++ * apps_smmu.
++ */
++&qupv3_id_2 {
++	status = "okay";
++};
++
++/* FIFO, and SE DMA for long transfers; no GPI DMA */
++&spi19 {
++	/delete-property/ dmas;
++	/delete-property/ dma-names;
++	/delete-property/ power-domains;
++	/delete-property/ operating-points-v2;
++
++	pinctrl-0 = <&qup_spi19_data_clk>, <&qup_spi19_cs>;
++	pinctrl-names = "default";
++
++	status = "okay";
++
++	/*
++	 * The vendor swd@0 (MCU programming), powerstate@0 and nsync@0 children
++	 * are deliberately left out.
++	 */
++	mcu@0 {
++		compatible = "oculus,hollywood-syncboss";
++		reg = <0>;
++		spi-max-frequency = <8000000>;
++		spi-cpol;
++		spi-cpha;
++		/* gpio4 -> PDC pin 107 (pinctrl-sm8250.c wakeirq map) */
++		interrupts-extended = <&tlmm 4 IRQ_TYPE_EDGE_RISING>;
++		ready-gpios = <&tlmm 4 GPIO_ACTIVE_HIGH>;
++		reset-gpios = <&tlmm 5 GPIO_ACTIVE_LOW>;
++		vdd-supply = <&vreg_s4a_1p8>;
++		imu-supply = <&vreg_l7c_3p0>;
++		mag-supply = <&vreg_l8c_1p8>;
++
++		pinctrl-0 = <&syncboss_reset_default>, <&syncboss_ready_default>;
++		pinctrl-names = "default";
++	};
++};

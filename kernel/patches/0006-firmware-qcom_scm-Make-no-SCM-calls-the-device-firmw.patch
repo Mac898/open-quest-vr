@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 06/16] firmware: qcom_scm: Make no SCM calls the device
+ firmware does not expect
+
+On the Oculus Quest 2 the SCM driver probes after a kexec from Android,
+against firmware that the 6.18 probe sends unexpected calls to:
+
+- Without qcom,dload-mode, set_download_mode falls back to
+  SET_DLOAD_MODE with arg0 = 0x10, which selects a full memory dump on
+  the next reset. Leave the download mode alone instead.
+- The firmware has no WAITQ service. Ask IS_CALL_AVAIL before
+  WAITQ_GET_INFO and use the existing fallback if it is missing.
+- Make the QTEE SMCINVOKE probe only with CONFIG_QCOMTEE; nothing binds
+  to the device it registers otherwise.
+
+Log the results of the remaining boot calls in one line.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ drivers/firmware/qcom/qcom_scm.c | 44 +++++++++++++++++++++++++++-----
+ 1 file changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/firmware/qcom/qcom_scm.c b/drivers/firmware/qcom/qcom_scm.c
+index 226265b31..1f79e104c 100644
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -553,6 +553,19 @@ static void qcom_scm_set_download_mode(u32 dload_mode)
+ {
+ 	int ret = 0;
+ 
++	/*
++	 * Without qcom,dload-mode, leave the download mode as the previous boot
++	 * stage set it. The SCM fallback below (arg0 = 0x10) selects a full
++	 * memory dump on the next reset on some devices, such as the Oculus
++	 * Quest 2.
++	 */
++	if (!__scm->dload_mode_addr) {
++		if (dload_mode)
++			dev_warn(__scm->dev,
++				 "no qcom,dload-mode: download mode left unchanged\n");
++		return;
++	}
++
+ 	if (__scm->dload_mode_addr) {
+ 		ret = qcom_scm_io_rmw(__scm->dload_mode_addr, QCOM_DLOAD_MASK,
+ 				      FIELD_PREP(QCOM_DLOAD_MASK, dload_mode));
+@@ -2439,6 +2452,7 @@ static int qcom_scm_probe(struct platform_device *pdev)
+ {
+ 	struct qcom_tzmem_pool_config pool_config;
+ 	struct qcom_scm *scm;
++	bool waitq;
+ 	int irq, ret;
+ 	int i;
+ 
+@@ -2507,7 +2521,15 @@ static int qcom_scm_probe(struct platform_device *pdev)
+ 		goto err_rmem;
+ 	}
+ 
+-	ret = qcom_scm_query_waitq_count(scm);
++	/*
++	 * Older firmware, such as the Oculus Quest 2's, has no WAITQ service;
++	 * ask before calling it. Without it: one default waitqueue and no
++	 * waitqueue IRQ.
++	 */
++	waitq = __qcom_scm_is_call_available(scm->dev, QCOM_SCM_SVC_WAITQ,
++					     QCOM_SCM_WAITQ_GET_INFO);
++
++	ret = waitq ? qcom_scm_query_waitq_count(scm) : -EOPNOTSUPP;
+ 	scm->wq_cnt = ret < 0 ? QCOM_SCM_DEFAULT_WAITQ_COUNT : ret;
+ 	scm->waitq_comps = devm_kcalloc(&pdev->dev, scm->wq_cnt, sizeof(*scm->waitq_comps),
+ 					GFP_KERNEL);
+@@ -2517,7 +2539,7 @@ static int qcom_scm_probe(struct platform_device *pdev)
+ 	for (i = 0; i < scm->wq_cnt; i++)
+ 		init_completion(&scm->waitq_comps[i]);
+ 
+-	irq = qcom_scm_get_waitq_irq(scm);
++	irq = waitq ? qcom_scm_get_waitq_irq(scm) : -EOPNOTSUPP;
+ 	if (irq < 0)
+ 		irq = platform_get_irq_optional(pdev, 0);
+ 
+@@ -2553,8 +2575,13 @@ static int qcom_scm_probe(struct platform_device *pdev)
+ 	/*
+ 	 * Disable SDI if indicated by DT that it is enabled by default.
+ 	 */
+-	if (of_property_read_bool(pdev->dev.of_node, "qcom,sdi-enabled") || !download_mode)
+-		qcom_scm_disable_sdi();
++	if (of_property_read_bool(pdev->dev.of_node, "qcom,sdi-enabled") || !download_mode) {
++		ret = qcom_scm_disable_sdi();
++		/* The results of the boot-time SCM calls, in one line */
++		dev_info(scm->dev,
++			 "quest2: SDI_CONFIG(1, 0) returned %d; WAITQ_GET_INFO %savailable; irq %d\n",
++			 ret, waitq ? "" : "not ", irq);
++	}
+ 
+ 	/*
+ 	 * Initialize the QSEECOM interface.
+@@ -2569,8 +2596,13 @@ static int qcom_scm_probe(struct platform_device *pdev)
+ 	ret = qcom_scm_qseecom_init(scm);
+ 	WARN(ret < 0, "failed to initialize qseecom: %d\n", ret);
+ 
+-	/* Initialize the QTEE object interface. */
+-	qcom_scm_qtee_init(scm);
++	/*
++	 * Initialize the QTEE object interface, only if the QTEE driver is
++	 * built: otherwise nothing binds to the device, and older firmware does
++	 * not expect the SMCINVOKE INVOKE call (0x72000602) the probe makes.
++	 */
++	if (IS_ENABLED(CONFIG_QCOMTEE))
++		qcom_scm_qtee_init(scm);
+ 
+ 	return 0;
+ 

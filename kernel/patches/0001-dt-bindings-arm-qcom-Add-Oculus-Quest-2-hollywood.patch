@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 01/16] dt-bindings: arm: qcom: Add Oculus Quest 2 (hollywood)
+
+Add the "oculus" vendor prefix (Oculus VR, LLC, now part of Meta
+Platforms) and the compatible of the Oculus Quest 2 VR headset, codename
+"hollywood", which is built on the Qualcomm XR2 (SM8250) SoC.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ Documentation/devicetree/bindings/arm/qcom.yaml        | 1 +
+ Documentation/devicetree/bindings/vendor-prefixes.yaml | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/arm/qcom.yaml b/Documentation/devicetree/bindings/arm/qcom.yaml
+index 18b5ed044..38a1b7f0d 100644
+--- a/Documentation/devicetree/bindings/arm/qcom.yaml
++++ b/Documentation/devicetree/bindings/arm/qcom.yaml
+@@ -987,6 +987,7 @@ properties:
+ 
+       - items:
+           - enum:
++              - oculus,hollywood
+               - qcom,qrb5165-rb5
+               - qcom,sm8250-hdk
+               - qcom,sm8250-mtp
+diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+index a9cf85fd6..70b46d793 100644
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -1161,6 +1161,8 @@ patternProperties:
+     description: Orient Chip Technology Co., Ltd.
+   "^oct,.*":
+     description: Octavo Systems LLC
++  "^oculus,.*":
++    description: Oculus VR, LLC (Meta Platforms)
+   "^okaya,.*":
+     description: Okaya Electric America, Inc.
+   "^oki,.*":

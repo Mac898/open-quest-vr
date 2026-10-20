@@ -1,0 +1,2081 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""dev: command-line client for a Quest 2 running the mainline initramfs (telnet shell over USB).
+
+    tools/dev check 'CMD' | -f FILE  offline: say whether CMD (or each line of FILE) would be refused
+    tools/dev status                 link + uptime + kernel + battery one-liner
+    tools/dev battery [--csv]        battery capacity/temp/status/voltage/current
+    tools/dev sh 'CMD' [-t SECS]     run CMD on the headset (root busybox sh), print output
+    tools/dev pull REMOTE LOCAL      copy a file off the headset (base64 over telnet)
+    tools/dev log [N]                last N lines of the target kernel log (/tmp/kernel.log)
+    tools/dev return-android [--kexec-dir DIR]
+                                     back to Android. Mainline init: creates /tmp/lvr-return; the
+                                     init then does a warm reset (through /proc/lvr_warm_reset when it
+                                     reads `armed`) or its watchdog-bite reset. Exit 0 "warm reset
+                                     presumed" means the link dropped before any reset state was seen;
+                                     the pstore console log after the return confirms it. On the
+                                     downstream quest-kexec boot (4.19 kernel) it runs that checkout's
+                                     tools/return-android.sh: --kexec-dir DIR or $QUEST_KEXEC_DIR
+                                     (needed only then).
+    tools/dev s2-up [NAME] [--port P] [--sha SHA256]  fetch rootfs/out/NAME (default stage2-latest) from
+                                     tools/serve-usb.py into a 1 GiB tmpfs at /stage2,
+                                     verify sha256, extract, rbind /proc /sys /dev /tmp
+    tools/dev s2 'CMD' [-t SECS]     run CMD inside the stage-2 rootfs (chroot /stage2 /bin/sh -c)
+    tools/dev s2-down                unmount everything under /stage2, then the tmpfs; rmdir.
+                                     Refuses while processes run in the chroot. Never rm -rf.
+    tools/dev syncboss-txlen         write the fixed value 248 to the syncboss
+                                     control/transaction_length. The only spi1.0 sysfs write
+                                     tools/dev can send; no argument.
+    tools/dev fw-fallback on|off|status
+                                     firmware-loader sysfs fallback: off = ignore_sysfs_fallback 1
+                                     (set for syncboss captures), on = 0 (restore), status = read.
+    tools/dev fan-test SECONDS       mainline pwm-fan only: find the fan hwmon by name
+                                     (pwmfan, driver pwm-fan), record pwm1_enable/pwm1, set
+                                     pwm1=255, sample fan1_input every 2 s for SECONDS (4..60),
+                                     then restore both (shell trap: also on error/HUP/TERM).
+                                     One self-checked fixed command; the only fan write.
+    tools/dev load-step --cores N --seconds S [--fan255 RPM] [--log FILE]
+                                     mainline: N (1|2|4|8) busybox `yes` workers on fixed
+                                     CPUs, each bounded on the device by `timeout S` (30..300),
+                                     under a host-side guard that samples thermal zones, fan and
+                                     gauge every 15 s and kills the workers (explicit PIDs) at
+                                     >= 78 C, a fan not at 255/rpm above the 70 C trip, gauge
+                                     > 42.0 C or < 45 %. --cores 0 = sampling only. Samples are
+                                     also appended to FILE (default logs/load-step.log).
+    tools/dev drain [--log FILE]     mainline: one gauge drain sample (uptime, capacity, voltage,
+                                     current, charge, temp; a fixed read-only command), appended
+                                     to FILE (default logs/drain.log) as a `DRAIN epoch=...` line.
+                                     If FILE's last sample is younger than DRAIN_GAP (60 s, host
+                                     clock), it waits out the rest first: the spacing is the tool's.
+    tools/dev heartbeat [--loop SECS] [--max-duration SECS]
+                                     mainline init only: refresh the heartbeat dead-man
+                                     (one fixed command: target uptime -> /tmp/lvr-heartbeat) and
+                                     print the deadline. --loop repeats every SECS (10..300) until
+                                     Ctrl-C/kill, the first failure, a reset already armed, or
+                                     --max-duration (default 3600 s, max 14400) runs out. When it
+                                     stops, the target resets lvr_deadman s after the last heartbeat.
+    tools/dev cpufreq-cap cap|uncap|status
+                                     cap = policy4/policy7 scaling_max_freq 1478400/1075200,
+                                     uncap = 2419200/2841600 (cpuinfo_max). One sha-pinned command:
+                                     precheck related_cpus "4 5 6"/"7", driver qcom-cpufreq-hw,
+                                     cpuinfo_max (no write on a mismatch), the two literal writes,
+                                     readback. status = read-only.
+    tools/dev mod-fetch RELEASE --sha SHA256 [--port P]
+                                     fetch modules-RELEASE.tar.gz from serve-usb, verify the
+                                     pinned sha256 and that every member is under lib/modules/RELEASE/,
+                                     unpack into /lib/modules (RAM). RELEASE must equal `uname -r`.
+    tools/dev mod-load|mod-unload LABEL --allow FILE
+                                     one insmod (with the file's parameters) / rmmod of one
+                                     module named in the allowlist FILE (`release REL`, then
+                                     `LABEL kernel/<path>.ko sha256:<hex> [param=value ...]
+                                     [loaded:MOD] [bound:DEV]`); MOD_DENY never loads.
+                                     Format and example: examples/module-allowlist.txt.
+    tools/dev kexec-self status|fetch|load|exec|unload [--image-sha S --initrd-sha S --cmdline C]
+                                     same-DT self-kexec: fetch Image + initramfs
+                                     from the served payload dir (sha-checked), `kexec -s -l` with the
+                                     pinned shas and a cmdline from a fixed token allowlist
+                                     (rdinit=/init first, panic=0|10, lvr_kexec=1; optional
+                                     watchdog.open_timeout=90 initcall_debug ignore_loglevel ...),
+                                     exec = arm qcom_wdt (30 s bite) right before
+                                     `kexec -e`, refused unless loaded, no NFS/stage 2/load, < 65 C.
+
+Environment: QKX_HOST (default 10.42.0.2) is the headset's address; QUEST_KEXEC_DIR is a
+quest-kexec checkout (https://github.com/Mac898/quest-kexec), used only by return-android on
+the downstream boot; QUEST_LOG_DIR (default ./logs) is where load-step and drain keep their logs.
+
+Transport: telnet to the unauthenticated root shell the initramfs starts (rootfs/mainline-init and
+quest-kexec both do). Storage and MCU interfaces on the headset can be damaged by a stray write, so
+every command passes a DENYLIST first (DENY, RISKY and the rule helpers below): anything that could
+write persistent storage, program an MCU, read secure memory or reboot the device is refused, and so
+are writes into /sys, /proc and configfs and any write naming /sys/power. `tools/dev check 'CMD'` runs
+the same test offline. Rebooting only happens through `return-android`. The only write exceptions are
+fixed, self-checked strings: `syncboss-txlen`, `fw-fallback`, `fan-test`, `cpufreq-cap`, the `mod-*`
+insmod/rmmod commands and `kexec-self`. The denylist guards against slips, it is not a sandbox: it
+cannot see through eval or printf-assembled command names. The shell is an interactive ash with line
+editing, so every transmitted line stays under LINE_MAX (1000) bytes without control characters;
+_send refuses anything else before connecting.
+"""
+import argparse
+import base64
+import hashlib
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+
+HOST = os.environ.get("QKX_HOST", "10.42.0.2")
+# Checkout of https://github.com/Mac898/quest-kexec; only return-android on the downstream boot needs it.
+KEXEC_DIR_ENV = "QUEST_KEXEC_DIR"
+LOG_DIR = os.environ.get("QUEST_LOG_DIR", "logs")
+
+# Refused outright: persistent writes, flashing, secure/physical memory, MCU programming.
+DENY = [
+    (r"\bdd\b[^;|&]*\bof=", "dd with of= (write)"),
+    (r"\b(mkfs|mke2fs|mkswap|fdisk|sfdisk|gdisk|sgdisk|parted|blkdiscard|wipefs|tune2fs|resize2fs|fsck)\b", "filesystem/partition tool"),
+    (r"\b(flash_erase|flashcp|nandwrite|mtd_debug|ubiformat|fastboot)\b", "flash tool"),
+    (r">>?\s*\S*/dev/(block|sd|mmcblk|ufs|mtd|disk)", "redirect into a block device"),
+    (r"/dev/(mem|kmem)\b", "/dev/mem access (secure memory hazard)"),
+    (r"\bdevmem\b", "devmem (secure memory hazard)"),
+    (r"\bmount\b[^;|&]*/dev/(block|sd|mmcblk)", "mounting device storage"),
+    (r"(swd|syncboss|nrf)[^;|&]*(flash|program|fw_?update|update_?fw|firmware)", "MCU programming"),
+    (r">>?\s*\S*(syncboss|swd|nrf)", "write into syncboss/SWD/nRF interface"),
+    (r"(\bblu\b|blu_|blu-|ttyHS13)[^;|&]*(flash|program|fw_?update|update_?fw|firmware)", "display BLU MCU programming"),
+    (r">>?\s*\S*(ttyHS13|\bblu\b|blu_|blu-)", "write into the display BLU MCU interface"),
+    (r"\bupdate_firmware\b", "MCU firmware update attribute"),
+    (r"(syncboss\w*|spi1\.0)/swd\b", "syncboss SWD interface (never touch)"),
+    (r"swd@\d|:swd\b|\bupdate_status\b", "syncboss SWD device node / update_status (never touch)"),
+    (r">>?\s*\S*/spi1\.0/\S*", "write into the syncboss SPI device's sysfs (control/reset etc.)"),  # = SB_WHY_DENY
+    (r"\bttyHS14\b", "syncboss-side UART (never touch)"),
+    (r"/dev/syncboss_powerstate", "syncboss powerstate (sends prox calibration to the MCU; never touch)"),
+    (r"\b(i2cset|i2ctransfer|setpci|watchdog|wdctl|rtcwake|hwclock|fbset|stty|spidev_test)\b", "hardware-state write tool"),
+    (r"/sys/kernel/debug/(dri|mdss|mdp|kgsl|iommu|arm-smmu)", "display/GPU/IOMMU debugfs (secure memory hazard)"),
+    (r"/sys/kernel/debug/(gpio|pinctrl/[^ ]*/pins)\b", "raw GPIO/pin register dump (reserved-GPIO hazard)"),
+    # The stage-2 chroot shares the real /dev and /tmp, so these matter there too:
+    (r"\brm\b[^;|&\n]*\s(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=[\s;|&'\"]|$)", "recursive rm"),
+    (r"\bumount\b[^;|&\n]*?\s['\"]?(-[a-zA-Z]*a[a-zA-Z]*|--all|/(dev|tmp|proc|sys|config)(/\S*)?|/)(?=[\s;|&'\"]|$)",
+     "umount of a system mount (/, /dev, /proc, /sys, /tmp, /config) or umount -a"),
+    (r"\bqkx-(launch|switch)", "qkx-launch / qkx-switch (makes PID 1 switch_root)"),
+    (r"/dev/watchdog", "/dev/watchdog* (opening it can arm a hardware watchdog)"),
+    (r"\bi2cdetect\b(?!\s+-[lV](?=[\s;|&'\"]|$))", "i2cdetect bus probing (only -l / -V)"),
+    (r"\blspci\b(?!\s+(--version|-n)(?=\s*($|[;|&'\"])))", "lspci config-space reads (only --version / -n)"),
+]
+# Any block-device path is refused unless the whole command is a plain `ls`: too many writers to list.
+BLOCKDEV = re.compile(r"/dev/(block\b|sd[a-z]|mmcblk|ufs|mtd|disk\b)")
+PLAIN_LS = re.compile(r"\s*ls(\s+-[a-zA-Z]+)*(\s+[\w./@:+-]+)*\s*")
+# Commands naming the syncboss SPI sysfs (also globs like spi1*), SWD, the misc/syncboss alias,
+# /dev/syncboss* or /dev/ttyHS* may not contain an output redirect or a writer tool: reads work, no
+# write form does. Writes to the control attribute names are refused wherever they point. The only
+# exception is SYNCBOSS_TXLEN_CMD, sent by `tools/dev syncboss-txlen`, never via run().
+# The capture tool opens /dev/syncboss0 itself; its command line names only /tmp/lvr/syncboss_capture.py.
+SB_TOUCH = re.compile(r"spi1(?:[.*?\[]|\b)|swd|misc/sync|/dev/sync|/dev/ttyHS|894000\.spi|syncboss_nrf")
+SB_ATTRS = (r"transaction_length|minimum_time_between_transactions_us|maximum_send_delay_us|"
+            r"spi_max_clk_rate|cpu_affinity|poll_prio|enable_fastpath|enable_data_headers|"
+            r"transaction_period_us|next_avail_seq_num|num_rejected_transactions|streaming|"
+            r"stats|power|reset")
+SB_ATTR_WRITE = re.compile(r">>?\s*['\"]?\S*\b(" + SB_ATTRS + r")\b")
+SB_WHY_ATTR = "redirect into a syncboss control attribute name (use `tools/dev syncboss-txlen`)"
+SB_WHY_REDIRECT = "output redirect in a command that names a syncboss/SWD/MCU-UART path"
+SB_WHY_WRITER = "writer tool in a command that names a syncboss/SWD/MCU-UART path"
+SB_WHY_DENY = "write into the syncboss SPI device's sysfs (control/reset etc.)"
+WRITER = re.compile(r"\b(tee|cp|mv|install|ln|truncate|dd|sed|awk|python3?|perl|busybox|xargs|eval|exec|sh|ash|bash)\b")
+# Write detection for the glob and cd rules. sed/awk count only with -i or a redirect, so read-only pipelines pass.
+STRICT_WRITER = re.compile(
+    r"\b(tee|cp|mv|install|ln|truncate|dd|python3?|perl|busybox|xargs|eval|exec|sh|ash|bash|"
+    r"tar|rm|rmdir|unlink|mknod|mkfifo|touch|chmod|chown|wget|curl)\b|\bsed\b[^;|&]*\s-[a-zA-Z]*i")
+# Glob characters: * and ? not after $ ($*, $?), [ not followed by a blank ([ -e x ] is test).
+GLOB = re.compile(r"(?<!\$)[*?]|\[(?=\S)")
+CD = re.compile(r"\b(cd|pushd)\b\s*([^\s;&|)]*)")
+SAFE_CD = re.compile(r"['\"]?/tmp(/[\w.+-]+)*/?['\"]?")
+CAPTURE_TOOL = "/tmp/lvr/syncboss_capture.py"
+CAPTURE_START = re.compile(
+    r"sha256sum /tmp/lvr/syncboss_capture\.py \| grep -q '\^[0-9a-f]{64} ' && "
+    r"\(setsid chroot /stage2 /usr/bin/python3 -I /tmp/lvr/syncboss_capture\.py capture ")
+
+
+def _redirects(cmd):
+    """True if cmd has an output redirect other than to /dev/null or an fd dup (2>&1).
+    Quote-aware: '>' inside '...' or inside "..." text is not a redirect, but '>' inside
+    $(...) or `...` (also within "...") is. Unbalanced quoting counts as a redirect."""
+    stack, i, n = ["N"], 0, len(cmd)
+    while i < n:
+        c, top = cmd[i], stack[-1]
+        if top == "S":
+            if c == "'":
+                stack.pop()
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if top == "D":
+            if c == '"':
+                stack.pop()
+            elif c == "$" and cmd[i + 1:i + 2] == "(":
+                stack.append("P")
+                i += 1
+            elif c == "`":
+                stack.append("B")
+            i += 1
+            continue
+        # unquoted context: N (top level), P ($(...) or (...)), B (`...`)
+        if c == "'":
+            stack.append("S")
+        elif c == '"':
+            stack.append("D")
+        elif c == "(":
+            stack.append("P")
+        elif c == ")" and top == "P":
+            stack.pop()
+        elif c == "`":
+            if top == "B":
+                stack.pop()
+            else:
+                stack.append("B")
+        elif c == ">":
+            rest = cmd[i + 1:]
+            if rest.startswith("&"):
+                pass                                   # 2>&1, >&2: fd duplication
+            elif not re.match(r">?\s*/dev/null(?![\w/.-])", rest):
+                return True
+            elif rest.startswith(">"):
+                i += 1
+        i += 1
+    return stack != ["N"]
+
+
+def _writes(cmd):
+    return _redirects(cmd) or bool(STRICT_WRITER.search(cmd))
+
+
+def _redirect_targets(cmd):
+    """Raw target words of every output redirect in cmd ('>', '>>', '>|', '<>', 'N>', '&>',
+    '>& word' when word is not an fd), quotes removed. Same quote model as _redirects():
+    '>' inside '...' or "..." text is not a redirect, inside $(...) or `...` it is. An
+    unbalanced command yields a None entry (judged as non-literal)."""
+    out, stack, i, n = [], ["N"], 0, len(cmd)
+    stop = set(" \t\n;|&()<>`")
+    while i < n:
+        c, top = cmd[i], stack[-1]
+        if top == "S":
+            if c == "'":
+                stack.pop()
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if top == "D":
+            if c == '"':
+                stack.pop()
+            elif c == "$" and cmd[i + 1:i + 2] == "(":
+                stack.append("P")
+                i += 1
+            elif c == "`":
+                stack.append("B")
+            i += 1
+            continue
+        if c == "'":
+            stack.append("S")
+        elif c == '"':
+            stack.append("D")
+        elif c == "(":
+            stack.append("P")
+        elif c == ")" and top == "P":
+            stack.pop()
+        elif c == "`":
+            if top == "B":
+                stack.pop()
+            else:
+                stack.append("B")
+        elif c == ">":
+            j = i + 1
+            if cmd[j:j + 1] in (">", "|"):
+                j += 1
+            dup = cmd[j:j + 1] == "&"
+            if dup:
+                j += 1
+            while j < n and cmd[j] in " \t":
+                j += 1
+            # read one shell word (quotes kept as part of the word, then stripped)
+            k, q, word = j, None, ""
+            while k < n:
+                ch = cmd[k]
+                if q:
+                    if ch == q:
+                        q = None
+                    else:
+                        word += ch
+                elif ch in "'\"":
+                    q = ch
+                elif ch == "\\" and k + 1 < n:
+                    word += cmd[k + 1]
+                    k += 1
+                elif ch == "`":
+                    word += "`"                        # command substitution: non-literal
+                    break
+                elif ch in stop:
+                    break                              # incl. the '(' of $(...): '$' is in word
+                else:
+                    word += ch
+                k += 1
+            if q:
+                word = None
+            if not (dup and word is not None and re.fullmatch(r"\d*|-", word)):
+                out.append(word)                       # >&2, >&- are fd dups, not targets
+            i = max(i, k - 1)
+        i += 1
+    if stack != ["N"]:
+        out.append(None)
+    return out
+
+
+# Writes into sysfs/procfs/configfs (fan pwm1, regulators, cpu online, driver bind, configfs UDC and LED
+# attributes) are refused in free form. A path counts as one of these trees if any component is sys, proc
+# or config (/sys, /proc, /config, /stage2/sys, /proc/1/root/sys, ...), and Android's /d debugfs alias
+# too. Writers include tools with an output option (tar -C, sort -o, wget -O, curl -o, cpio, unzip -d, ...)
+# and sourcing a script. Exempt, exactly: the writes of `tools/dev fw-fallback`. HEARTBEAT_CMD writes only /tmp.
+SYSFS_WHY = "write into sysfs/procfs/configfs (/sys, /proc, /config): use a fixed `tools/dev` subcommand"
+SYSFS_WRITER_WHY = ("writer tool or interpreter in a command that names /sys, /proc or /config "
+                    "(read with cat/grep; redirect reads to /tmp with >)")
+CONFIGFS_WHY = "mkdir/rmdir/rm in configfs (/config, /sys/kernel/config: would change the USB gadget)"
+COMPUTED_WHY = "redirect to a computed path ($var, `...`, $(...), glob): spell the target out"
+SYS_COMPONENT = re.compile(r"(?:^|/)(?:sys|proc|config)(?:/|$)|^(?:\./|/)?d(?:/|$)")
+CONFIGFS_PATH = re.compile(r"(?:^|/)config(?:/|$)")
+SYSFS_WRITERS = re.compile(
+    r"(?<![\w.-])(?:tee|cp|mv|install|ln|truncate|touch|dd|chmod|chown|mknod|python3?|perl|"
+    r"sh|ash|bash|eval|xargs|awk|tar|cpio|unzip|wget|curl|tftp|ftpget|rsync|scp|uniq|split|"
+    r"patch|uudecode|dos2unix|unix2dos|ed|ex|vi|chgrp|source)(?![\w.-])|"
+    r"\bsed\b[^;|&]*\s-[a-zA-Z]*i|\bsed\b[^;|&]*['\";}\s]w\s*/|"
+    r"\bsort\b[^;|&]*\s(?:-[a-zA-Z]*o|--output)|(?:^|[;&|({]\s*|\bthen\s+|\bdo\s+)\.\s+\S")
+CONFIGFS_WRITERS = re.compile(r"(?<![\w.-])(?:mkdir|rmdir|rm|unlink)(?![\w.-])")
+
+
+def _names_sys(cmd, pat=SYS_COMPONENT):
+    return any(pat.search(_norm_path(t)) for t in PATH_TOKEN.findall(cmd) if "/" in t)
+
+
+def _fw_fallback_exempt(cmd):
+    return cmd in FW_FALLBACK_CMDS.values() or bool(
+        re.fullmatch(r"echo [01] > " + re.escape(FW_FALLBACK), cmd))
+
+
+def _sysfs_refusals(cmd):
+    if _fw_fallback_exempt(cmd):
+        return []
+    out = []
+    for t in _redirect_targets(cmd):
+        if t is None or re.search(r"[$`]", t) or GLOB.search(t):
+            if COMPUTED_WHY not in out:
+                out.append(COMPUTED_WHY)
+        elif SYS_COMPONENT.search(_norm_path(t)):
+            if SYSFS_WHY not in out:
+                out.append(SYSFS_WHY)
+    if _names_sys(cmd) and SYSFS_WRITERS.search(cmd):
+        out.append(SYSFS_WRITER_WHY)
+    if _names_sys(cmd, CONFIGFS_PATH) and CONFIGFS_WRITERS.search(cmd):
+        out.append(CONFIGFS_WHY)
+    return out
+
+
+# /sys/power: a write could start a system suspend, which has never been tried on this SoC. The generic
+# sysfs rule already refuses it; this one names the hazard and also catches writers in any command naming
+# /sys/power (any spelling, /stage2/sys/power, ...), a write after cd into it, and redirects into suspend
+# attributes. Reads stay allowed, also redirected to /tmp.
+SYS_POWER = re.compile(r"(?:^|/)sys/power(?:/|$)")
+SYS_POWER_ATTR = re.compile(r"(?:^|/)power/(?:state|mem_sleep|disk|autosleep|pm_test|wake_lock|wake_unlock|"
+                            r"wakeup_count|resume|resume_offset|image_size|reserved_size|"
+                            r"pm_freeze_timeout|sync_on_suspend|pm_async)$")
+POWER_WHY = "write naming /sys/power (system suspend control; never tried on this SoC)"
+
+
+def _power_refusal(cmd):
+    named = any(SYS_POWER.search(_norm_path(t)) for t in PATH_TOKEN.findall(cmd) if "/" in t)
+    cd_power = any(SYS_POWER.search(_norm_path(t.strip("'\""))) or t.strip("'\"").rstrip("/").endswith("power")
+                   for _, t in CD.findall(cmd))
+    if named and (SYSFS_WRITERS.search(cmd) or re.search(r"\bmkdir\b", cmd)):
+        return POWER_WHY
+    if cd_power and _writes(cmd):
+        return POWER_WHY
+    for t in _redirect_targets(cmd):
+        if t is not None and (SYS_POWER.search(_norm_path(t)) or SYS_POWER_ATTR.search(_norm_path(t))):
+            return POWER_WHY
+    return None
+
+
+def _kill_refusal(cmd):
+    """kill must name explicit numeric PIDs > 1; killall/pkill never."""
+    if re.search(r"\b(killall|pkill|killall5)\b", cmd):
+        return "killall/pkill (use kill with an explicit PID)"
+    for m in re.finditer(r"(?<![\w/.-])kill\b([^;&|)\n`]*)", cmd):
+        toks = m.group(1).split()
+        if toks[:1] == ["-l"]:
+            continue
+        if toks and toks[0].startswith("-") and toks[0] != "--":
+            toks = toks[2:] if toks[0] in ("-s", "-n") else toks[1:]
+        if toks[:1] == ["--"]:
+            toks = toks[1:]
+        if not toks or not all(t.isdigit() and int(t) > 1 for t in toks):
+            return "kill without explicit PIDs > 1 (never PID 1, -1, process groups or $(...))"
+    return None
+
+
+# Heartbeat dead-man state of the mainline init (rootfs/mainline-init/init.sh): only HEARTBEAT_CMD
+# (`tools/dev heartbeat`) may write it. mkdir counts: a pre-made /tmp/lvr-reset would make every reset
+# path think a reset is already armed. The init also rejects bad heartbeats itself.
+HEARTBEAT_CMD = ("cut -d' ' -f1 /proc/uptime > /tmp/lvr-heartbeat; echo hb=$(cat /tmp/lvr-heartbeat); "
+                 "cat /tmp/lvr-deadman /tmp/lvr-deadline 2>/dev/null; "
+                 "echo reset=$(cat /tmp/lvr-reset/reason 2>/dev/null); echo END")
+# The syncboss capture tool keeps its per-boot open budget in /tmp/lvr/sb-opens on the target. Commands
+# may read it but not write, move or delete it or /tmp/lvr.
+SB_OPENS = re.compile(r"sb-opens")
+SB_OPENS_RM = re.compile(r"\b(rm|rmdir|mv|unlink)\b[^;&|\n]*(?<![\w.-])lvr/*(?=$|[\s'\";|&)<>])")
+SB_OPENS_WHY = "write naming the syncboss open budget /tmp/lvr/sb-opens (only the capture tool writes it)"
+# /tmp/lvr-return is the return-to-Android request the init polls; only RETURN_CMD creates it.
+LVR_STATE = re.compile(r"/tmp/lvr-|\blvr-(heartbeat|deadman|deadline|reset|return)\b")
+LVR_WHY = ("write naming the lvr-init dead-man state (only `tools/dev heartbeat` and "
+           "`tools/dev return-android` write it)")
+
+# Refused unless run through the dedicated subcommand.
+RISKY = [
+    (r"\b(reboot|poweroff|halt)\b", "reboot/poweroff — use `tools/dev return-android`"),
+    (r"/proc/(qkx_bootdone|sysrq-trigger)", "reset trigger — use `tools/dev return-android`"),
+    (r"\bkexec\b", "kexec"),
+    (r"\b(insmod|rmmod|modprobe)\b", "module load/unload — use `tools/dev mod-load` with an allowlist (or pass --allow-modules)"),
+]
+
+# GPIO/pinctrl debugfs: msm pinctrl's pinconf-pins/pinconf-groups read every pin's CTL register without
+# the valid-mask check, so they would touch TrustZone-owned GPIOs and cause a secure-side reset (as does
+# /sys/kernel/debug/gpio). Refused however the path is spelled (//, /./, /d alias, relative after cd,
+# glob, variable), as are recursive readers that could walk in. debugfs may only be mounted read-only at
+# /sys/kernel/debug. A denylist cannot see through eval/printf-assembled names.
+DBG_ROOTS = ("/sys/kernel/debug", "/d")
+DBG_PATH = r"(?:/+sys/+kernel/+debug|(?<![\w.-])/d(?=/))"
+PIN_DEBUGFS = re.compile(DBG_PATH + r"(?:/+\.)*/+(?:pinctrl|gpio)")
+PIN_DEBUGFS_VAR = re.compile(DBG_PATH + r"(?:/+\.)*/+[^\s;|&/]*\$")
+PIN_FILES = re.compile(r"\bpin(?:conf|mux)-\w+|\bpingroups\b")
+PIN_WORDS = re.compile(r"pinctrl|pinconf|pinmux|gpio", re.I)
+DBG_WORDS = re.compile(r"/+sys/+kernel\b|debug|(?<![\w.-])/d/", re.I)
+RECURSIVE_READ = re.compile(
+    r"\b[ef]?grep\b[^;|&\n]*\s-[a-zA-Z]*[rR]|\brgrep\b|\btar\b|\bxargs\b|"
+    r"\bcp\b[^;|&\n]*\s-[a-zA-Z]*[rRa]|\bfind\b[^;|&\n]*\s-(exec|ok)")
+PATH_TOKEN = re.compile(r"[^\s;|&()<>'\"`=]+")
+DEBUGFS_MOUNT_OK = re.compile(
+    r"mount\s+(?:-t\s+debugfs\s+-o\s+ro|-o\s+ro\s+-t\s+debugfs)\s+(?:debugfs|none)\s+/sys/kernel/debug/?")
+PIN_WHY = "GPIO/pinctrl debugfs (reads reserved TZ-owned GPIO registers: secure reset hazard)"
+
+
+def _norm_path(p):
+    """Collapse // and /./ in an absolute path (no symlink or .. resolution)."""
+    p = re.sub(r"/+", "/", p)
+    while "/./" in p:
+        p = p.replace("/./", "/")
+    if p.endswith("/.") and len(p) > 2:
+        p = p[:-2]
+    return p
+
+
+def _reaches_debugfs(p):
+    """True if absolute literal path (or glob prefix) p is debugfs, inside it, or above it."""
+    p = _norm_path(p)
+    return any((root + "/").startswith(p) or p == root or p.startswith(root + "/")
+               for root in DBG_ROOTS)
+
+
+def _debugfs_refusals(cmd):
+    out = []
+    cds = [t for _, t in CD.findall(cmd)]
+    cd_dbg = any(t.startswith("/") and _reaches_debugfs(t.strip("'\"")) for t in cds)
+    cd_unknown = any(not t.strip("'\"").startswith("/") for t in cds)
+    globs = [t for t in PATH_TOKEN.findall(cmd) if GLOB.search(t)]
+    if (PIN_DEBUGFS.search(cmd) or PIN_DEBUGFS_VAR.search(cmd) or PIN_FILES.search(cmd)
+            or (PIN_WORDS.search(cmd) and (DBG_WORDS.search(cmd) or cd_dbg))):
+        out.append(PIN_WHY)
+    # A glob that can expand into debugfs: absolute or containing '/', with a literal prefix above or inside
+    # it; or any glob after a cd into/above debugfs or to an unknown directory.
+    for t in globs:
+        lit = t[:GLOB.search(t).start()]
+        if t.startswith("/") or "/" in t:
+            if _reaches_debugfs(lit if lit.startswith("/") else "/" + lit):
+                out.append("glob that can expand into debugfs (spell the path out)")
+                break
+    else:
+        if globs and (cd_dbg or cd_unknown or DBG_WORDS.search(cmd)):
+            out.append("glob in a command that names or enters debugfs (spell the path out)")
+    if RECURSIVE_READ.search(cmd):
+        tokens = [t for t in PATH_TOKEN.findall(cmd) if t.startswith("/")]
+        if (DBG_WORDS.search(cmd) or cd_dbg or cd_unknown or globs
+                or any(_reaches_debugfs(t) for t in tokens)):
+            out.append("recursive reader that can walk into debugfs")
+    for seg in re.split(r"[;&|\n]+", cmd):
+        if re.search(r"(?<![\w-])mount\b", seg) and re.search(r"debugfs|/+sys/+kernel/+debug", seg):
+            if not DEBUGFS_MOUNT_OK.fullmatch(seg.strip().removeprefix("busybox ")):
+                out.append("debugfs mount other than `mount -t debugfs -o ro debugfs /sys/kernel/debug`")
+                break
+    return out
+
+
+ANSI = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
+
+
+LINE_CONT = re.compile(r"\\\r?\n")
+
+
+# The one reboot-related command allowed, as this exact string at top level: reading the kernel's reboot
+# mode (`warm` would make a panic use PSCI SYSTEM_RESET2, which hangs). Everything else, including writes
+# to /sys/kernel/reboot/* and the same text inside s2, stays refused.
+REBOOT_WHY = "reboot/poweroff \u2014 use `tools/dev return-android`"
+REBOOT_MODE_READ = "cat /sys/kernel/reboot/mode"
+
+
+def refusals(cmd, allow_modules=False, _top=True):
+    """Every reason CMD is refused (empty list = allowed). Pure; no device access.
+    An exact s2_wrap(inner) is judged by its inner command (the wrapper is fixed text).
+    A shell removes backslash-newline before tokenising (`/s\\<NL>ys` is /sys),
+    so a command containing one is judged both as written and with them removed.
+    Exactly REBOOT_MODE_READ (top level, nothing else on the line) is allowed if the
+    reboot rule is its only refusal."""
+    if _top and cmd == REBOOT_MODE_READ and _refusals(cmd, allow_modules) == [REBOOT_WHY]:
+        return []
+    joined = LINE_CONT.sub("", cmd)
+    out = _refusals(cmd, allow_modules)
+    if joined != cmd:
+        out += [w for w in _refusals(joined, allow_modules) if w not in out]
+    return out
+
+
+# No debugfs mount at all inside the stage-2 chroot: its programs could read it unseen by the denylist.
+S2_DEBUGFS_MOUNT = re.compile(r"(?<![\w-])mount\b[^;&|\n]*(debugfs|/+sys/+kernel/+debug|(?<![\w.-])/d\b)")
+S2_DEBUGFS_WHY = "debugfs mount inside the stage-2 chroot (stage 2 never mounts debugfs)"
+
+
+def _refusals(cmd, allow_modules=False):
+    inner = s2_unwrap(cmd)
+    if inner is not None:
+        out = refusals(inner, allow_modules, _top=False)
+        if S2_DEBUGFS_MOUNT.search(LINE_CONT.sub("", inner)) and S2_DEBUGFS_WHY not in out:
+            out.append(S2_DEBUGFS_WHY)
+        return out
+    out = [why for pat, why in DENY if re.search(pat, cmd)]
+    if BLOCKDEV.search(cmd) and not PLAIN_LS.fullmatch(cmd):
+        out.append("block-device path outside a plain `ls`")
+    if SB_ATTR_WRITE.search(cmd):
+        out.append(SB_WHY_ATTR)
+    if SB_TOUCH.search(cmd):
+        if _redirects(cmd):
+            out.append(SB_WHY_REDIRECT)
+        if WRITER.search(cmd):
+            out.append(SB_WHY_WRITER)
+    if GLOB.search(cmd) and _writes(cmd):
+        out.append("glob character in a command that writes (spell the path out)")
+    if any(not SAFE_CD.fullmatch(t) or ".." in t for _, t in CD.findall(cmd)) and _writes(cmd):
+        out.append("cd outside /tmp in a command that writes (use absolute paths)")
+    if cmd != HEARTBEAT_CMD and LVR_STATE.search(cmd) and (_writes(cmd) or re.search(r"\bmkdir\b", cmd)):
+        out.append(LVR_WHY)
+    if (SB_OPENS.search(cmd) and (_writes(cmd) or re.search(r"\bmkdir\b", cmd))) or SB_OPENS_RM.search(cmd):
+        out.append(SB_OPENS_WHY)
+    if "syncboss_capture" in cmd and re.search(r"\bpython", cmd) and not CAPTURE_START.search(cmd):
+        out.append(f"the capture tool runs only as {CAPTURE_TOOL} behind the sha256 gate")
+    out += _debugfs_refusals(cmd)
+    out += _sysfs_refusals(cmd)
+    pw = _power_refusal(cmd)
+    if pw:
+        out.append(pw)
+    k = _kill_refusal(cmd)
+    if k:
+        out.append(k)
+    for pat, why in RISKY:
+        if allow_modules and "module" in why:
+            continue
+        if re.search(pat, cmd):
+            out.append(why)
+    return out
+
+
+def refusal(cmd, allow_modules=False):
+    """First reason CMD is refused, or None. Pure function; no device access."""
+    r = refusals(cmd, allow_modules)
+    return r[0] if r else None
+
+
+def check(cmd, allow_modules=False):
+    why = refusal(cmd, allow_modules)
+    if why:
+        sys.exit(f"tools/dev: refused ({why}): {cmd}")
+
+
+def run(cmd, timeout=30.0, allow_modules=False):
+    """Denylist-check cmd, then run it on the headset; return (output, exit_status).
+    Every device command goes through here, except the self-checked fixed strings of
+    syncboss-txlen, fan-test and return-android (mainline) and the downstream kexec return
+    script."""
+    check(cmd, allow_modules)
+    return _send(cmd, timeout)
+
+
+# Transport limits. The shell is `telnetd -l /bin/sh`: BusyBox ash on a pty with a line editor of
+# CONFIG_FEATURE_EDITING_MAX_LEN=1024 bytes. A line of 1024 bytes or more (newline included) is cut and the
+# shell hangs at its PS2 prompt; 1023 passes (tools/test_dev_telnet_sim.py). So every transmitted line,
+# wrapper included, stays under LINE_MAX. Control characters other than newline are line-editor keys (TAB,
+# ^C/^D/^U, ESC, 0xff telnet IAC) and are refused too.
+LINE_MAX = 1000
+TAG_MAX = "Q" + "9" * 7          # longest marker tag: Linux pid_max <= 4194304 (7 digits)
+LINE_CTRL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
+
+
+def _wrap(cmd, tag):
+    # Markers are split with "" so the echoed command line never contains them whole.
+    return f'echo {tag}""BEGIN; {cmd}; echo {tag}""END$?\n'
+
+
+def transport_refusal(cmd, tag=TAG_MAX):
+    """Why CMD can't go over the telnet shell (line length, control characters), or None.
+    Pure; judged on the wrapped text _send would transmit (worst-case tag by default)."""
+    if LINE_CTRL.search(cmd):
+        c = LINE_CTRL.search(cmd).group()
+        return f"control character {c!r} (the interactive shell's line editor would act on it)"
+    for i, line in enumerate(_wrap(cmd, tag).split("\n")[:-1], 1):
+        n = len(line.encode()) + 1
+        if n >= LINE_MAX:
+            return (f"transmitted line {i} is {n} bytes with the wrapper (limit < {LINE_MAX}: the "
+                    f"device shell's line editor cuts lines of 1024+ bytes); split it into lines")
+    return None
+
+
+def _send(cmd, timeout):
+    """Raw telnet transport. Never call directly; use run().
+    Refuses (SystemExit, before connecting) anything transport_refusal() names."""
+    tag = "Q%d" % os.getpid()
+    why = transport_refusal(cmd)
+    if why:
+        sys.exit(f"tools/dev: refused before sending ({why}): {cmd[:120]}...")
+    wrapped = _wrap(cmd, tag)
+    s = socket.create_connection((HOST, 23), timeout=5)
+    s.settimeout(0.2)
+    s.sendall(wrapped.encode())
+    buf, end = b"", time.time() + timeout
+    endpat = re.compile((tag + r"END(\d+)").encode())
+    while time.time() < end and not endpat.search(buf):
+        try:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        except socket.timeout:
+            pass
+    s.close()
+    buf = ANSI.sub(b"", buf.replace(b"\xff\xfb\x01", b"").replace(b"\xff\xfb\x03", b""))
+    m = endpat.search(buf)
+    begin = (tag + "BEGIN").encode()
+    start = buf.find(begin)
+    if start < 0 or not m:
+        raise TimeoutError(f"no complete response within {timeout}s")
+    out = buf[start + len(begin):m.start()].decode(errors="replace")
+    return out.replace("\r\n", "\n").lstrip("\n"), int(m.group(1))
+
+
+BATT = ("cd /sys/class/power_supply/battery && "
+        "echo $(date +%s),$(cat capacity),$(cat temp),$(cat status),"
+        "$(cat voltage_now),$(cat current_now)")
+
+
+def battery(csv=False):
+    out, _ = run(BATT, 10)
+    ts, cap, temp, status, uv, ua = out.strip().split(",")
+    if csv:
+        return out.strip()
+    return (f"battery {cap}% {int(temp)/10:.1f}C {status} "
+            f"{int(uv)/1e6:.3f}V {int(ua)/1e3:.0f}mA")
+
+
+STATUS_CMD = "uname -r; cut -d' ' -f1 /proc/uptime; cat /sys/devices/system/cpu/online"
+
+
+def no_shell(op, e):
+    """One-line error for status/battery when the mainline shell is not there (e.g. the headset
+    is in Android: no telnet shell)."""
+    if isinstance(e, ValueError):
+        return f"tools/dev {op}: unexpected answer from {HOST}:23 ({e})"
+    return (f"tools/dev {op}: no mainline shell at {HOST}:23 ({type(e).__name__}: {e}). tools/dev talks only to "
+            f"the Linux telnet shell; in Android use adb.")
+
+
+def status():
+    """`tools/dev status`: release, uptime, online CPUs and the battery line. 0, or 2 with one error line."""
+    try:
+        out, _ = run(STATUS_CMD, 10)
+        rel, up, cpus = out.split()
+        line = f"up {float(up):.0f}s kernel {rel} cpus {cpus}"
+    except (OSError, TimeoutError, ValueError) as e:
+        print(no_shell("status", e), file=sys.stderr)
+        return 2
+    try:
+        bat = battery()
+    except (OSError, TimeoutError, ValueError) as e:
+        bat = f"battery unreadable ({type(e).__name__}: {e})"
+    print(f"{line}; {bat}")
+    return 0
+
+
+# ---- stage-2 rootfs ----
+# Command builders are pure so tools/test_dev_denylist.py can check offline that every composed command
+# passes the denylist. Nothing removes files recursively: /stage2 is its own tmpfs, so cleanup is
+# unmount + rmdir.
+S2 = "/stage2"
+S2_SIZE = "1g"
+S2_BINDS = ["proc", "sys", "dev", "tmp"]
+S2_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+HOST_IP = "10.42.0.1"
+OUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rootfs", "out")
+
+
+def s2_wrap(cmd):
+    """Device command that runs cmd inside the stage-2 chroot."""
+    inner = f"export PATH={S2_PATH} HOME=/root TERM=vt100; {cmd}"
+    return (f"if grep -q ' {S2}/proc ' /proc/mounts; then chroot {S2} /bin/sh -c {shlex.quote(inner)}; "
+            f"else echo 'stage2 not up (tools/dev s2-up)'; false; fi")
+
+
+def s2_unwrap(cmd):
+    """inner if cmd == s2_wrap(inner) exactly, else None."""
+    pre = f"if grep -q ' {S2}/proc ' /proc/mounts; then chroot {S2} /bin/sh -c "
+    post = "; else echo 'stage2 not up (tools/dev s2-up)'; false; fi"
+    if not (cmd.startswith(pre) and cmd.endswith(post)):
+        return None
+    mid = cmd[len(pre):len(cmd) - len(post)]
+    try:
+        toks = shlex.split(mid)
+    except ValueError:
+        return None
+    if len(toks) != 1 or shlex.quote(toks[0]) != mid:
+        return None
+    head = f"export PATH={S2_PATH} HOME=/root TERM=vt100; "
+    if not toks[0].startswith(head) or s2_wrap(toks[0][len(head):]) != cmd:
+        return None
+    return toks[0][len(head):]
+
+
+def s2_up_steps(name, port, sha):
+    """(label, device command, timeout) for bringing stage 2 up."""
+    url = f"http://{HOST_IP}:{port}/{name}"
+    tgz = f"{S2}/.stage2.tar.gz"
+    # rbind, not bind: /dev carries /dev/pts and /sys may carry debugfs, and a plain bind over locked
+    # submounts fails in a user namespace. rprivate keeps unmounting the copies from propagating back.
+    binds = "; ".join(f"mkdir -p {S2}/{d} && mount -o rbind /{d} {S2}/{d} || echo BINDFAIL {d}"
+                      for d in S2_BINDS)
+    binds += f"; mount --make-rprivate {S2} || echo BINDFAIL rprivate"
+    # The /sys rbind must not carry a mounted debugfs into the chroot (pinctrl/gpio debugfs reads reset the
+    # SoC and the denylist cannot see what chroot programs open). The precheck refuses if debugfs is mounted
+    # anywhere; the bind step re-checks (BINDFAIL debugfs stops s2-up, s2-down detaches the copy).
+    # if/fi rather than `grep -q ... && echo`: a quiet guard must exit 0.
+    binds += (f"; if grep ' {S2}/' /proc/mounts | grep -q -e ' debugfs ' -e ' {S2}/sys/kernel/debug '; "
+              f"then echo BINDFAIL debugfs; fi")
+    return [
+        ("precheck", f"if [ -e {S2} ]; then echo EXISTS; else echo FREE; fi; "
+                     f"grep -E '^(MemAvailable|MemFree)' /proc/meminfo; "
+                     f"grep -q -e ' /sys/kernel/debug ' -e ' debugfs ' /proc/mounts && echo DEBUGFS_MOUNTED; true", 10),
+        ("tmpfs", f"mkdir {S2} && mount -t tmpfs -o size={S2_SIZE},mode=0755 stage2 {S2} "
+                  f"&& grep ' {S2} ' /proc/mounts", 10),
+        ("fetch", f"wget -q -T 20 -O {tgz} {url} && ls -l {tgz}", 180),
+        ("verify", f"sha256sum {tgz} | grep -q '^{sha} ' && echo SHA_OK || "
+                   f"{{ sha256sum {tgz}; echo SHA_BAD; false; }}", 60),
+        ("extract", f"tar -xzf {tgz} -C {S2} && rm -f {tgz} && du -sh {S2}", 300),
+        ("bind", binds, 15),
+        ("mounts", f"grep ' {S2}' /proc/mounts", 10),
+        ("smoke", s2_wrap("cat /etc/alpine-release; python3 -V"), 30),
+    ]
+
+
+def s2_procs_cmd():
+    """Device command listing PIDs whose root is the stage-2 chroot."""
+    return (f"for p in /proc/[0-9]*; do [ \"$(readlink $p/root 2>/dev/null)\" = {S2} ] "
+            f"&& echo \"${{p#/proc/}} $(cat $p/comm 2>/dev/null)\"; done; true")
+
+
+def s2_down_steps():
+    """(label, device command, timeout) for tearing stage 2 down. Unmount only."""
+    return [
+        ("procs", s2_procs_cmd(), 15),
+        # Each rbind copy is detached as a whole tree (umount -l), submounts included; the rprivate from
+        # s2-up keeps that from reaching the real /proc, /sys, /dev, /tmp. Anything else under /stage2 is
+        # unmounted children-first. Mounts are matched exactly in /proc/mounts, not with `mountpoint` (it
+        # follows symlinks); a symlinked /stage2/<d> stops the teardown.
+        ("unbind", "; ".join(f"if [ -L {S2}/{d} ]; then echo SYMLINK {d}; "
+                             f"elif grep -q ' {S2}/{d} ' /proc/mounts; then umount -l {S2}/{d} "
+                             f"|| echo UMOUNTFAIL {d}; fi" for d in reversed(S2_BINDS))
+                   + f"; grep -o ' {S2}/[^ ]*' /proc/mounts | sort -r | "
+                   f"while read m; do umount \"$m\" || echo UMOUNTFAIL $m; done; "
+                   f"grep -c ' {S2}/' /proc/mounts || true", 20),
+        ("tmpfs", f"if grep -q ' {S2}/' /proc/mounts; then echo STILL_BOUND; false; "
+                  f"elif grep -q ' {S2} ' /proc/mounts; then umount {S2} && rmdir {S2} && echo S2_GONE; "
+                  f"elif [ -e {S2} ]; then echo 'NOT_A_MOUNT: leaving {S2} alone'; false; "
+                  f"else echo S2_GONE; fi", 20),
+    ]
+
+
+def run_steps(steps, stop_on=()):
+    for label, cmd, t in steps:
+        out, rc = run(cmd, t)
+        print(f"[{label}] rc={rc}")
+        if out.strip():
+            print("  " + out.rstrip().replace("\n", "\n  "))
+        if rc or any(s in out for s in stop_on):
+            sys.exit(f"tools/dev: step '{label}' failed; stopping")
+
+
+def s2_up(name, port, pin=None):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name.startswith("."):
+        sys.exit(f"tools/dev: bad tarball name {name!r}")
+    path = os.path.realpath(os.path.join(OUT_DIR, name))
+    if os.path.dirname(path) != os.path.realpath(OUT_DIR):
+        sys.exit(f"tools/dev: {name} resolves outside rootfs/out")
+    shafile = path + ".sha256"
+    if not os.path.isfile(path) or not os.path.isfile(shafile):
+        sys.exit(f"tools/dev: {path} or its .sha256 missing (run rootfs/build.sh)")
+    sha = open(shafile).read().split()[0]
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        sys.exit(f"tools/dev: bad sha256 in {shafile}")
+    if pin is not None and sha != pin.lower():
+        sys.exit(f"tools/dev: {os.path.basename(path)} has sha256 {sha}, not the pinned {pin}; "
+                 f"a rebuilt tarball needs a new pin")
+    steps = s2_up_steps(os.path.basename(path), port, sha)
+    out, _ = run(steps[0][1], steps[0][2])
+    print("[precheck]\n  " + out.rstrip().replace("\n", "\n  "))
+    if "EXISTS" in out:
+        sys.exit(f"tools/dev: {S2} already exists; run `tools/dev s2-down` first")
+    if "DEBUGFS_MOUNTED" in out:
+        sys.exit("tools/dev: debugfs is mounted on the target; the /sys rbind would carry it into "
+                 "the stage-2 chroot, so s2-up refuses. Nothing was mounted.")
+    run_steps(steps[1:], stop_on=("BINDFAIL", "SHA_BAD"))
+
+
+def s2_down():
+    out, _ = run(s2_procs_cmd(), 15)
+    if out.strip():
+        sys.exit("tools/dev: processes still run inside /stage2 (pid comm):\n  "
+                 + out.rstrip().replace("\n", "\n  ")
+                 + "\nstop them first (tools/dev s2 'kill PID'), then re-run s2-down")
+    run_steps(s2_down_steps()[1:], stop_on=("SYMLINK", "UMOUNTFAIL", "STILL_BOUND", "NOT_A_MOUNT"))
+
+
+# ---- syncboss capture setup ----
+# The two writes a capture needs: control/transaction_length = 248, and ignore_sysfs_fallback 1 (restored after).
+SB_CONTROL = "/sys/bus/spi/devices/spi1.0/control"
+SYNCBOSS_TXLEN = 248
+SYNCBOSS_TXLEN_CMD = (f"cat {SB_CONTROL}/transaction_length && "
+                      f"echo {SYNCBOSS_TXLEN} > {SB_CONTROL}/transaction_length && "
+                      f"cat {SB_CONTROL}/transaction_length")
+FW_FALLBACK = "/proc/sys/kernel/firmware_config/ignore_sysfs_fallback"
+FW_FALLBACK_CMDS = {
+    "status": f"cat {FW_FALLBACK}",
+    "off": f"cat {FW_FALLBACK} && echo 1 > {FW_FALLBACK} && cat {FW_FALLBACK}",
+    "on": f"cat {FW_FALLBACK} && echo 0 > {FW_FALLBACK} && cat {FW_FALLBACK}",
+}
+
+
+def syncboss_txlen():
+    """Send SYNCBOSS_TXLEN_CMD, the one spi1.0 sysfs write allowed. It bypasses the
+    denylist (which refuses it everywhere else) only as this exact constant string."""
+    cmd = SYNCBOSS_TXLEN_CMD
+    if cmd != ("cat /sys/bus/spi/devices/spi1.0/control/transaction_length && "
+               "echo 248 > /sys/bus/spi/devices/spi1.0/control/transaction_length && "
+               "cat /sys/bus/spi/devices/spi1.0/control/transaction_length"):
+        sys.exit("tools/dev: syncboss-txlen command was modified; refusing")
+    # The denylist must refuse it through the syncboss-sysfs write rule (the generic sysfs rule alone is not
+    # enough) and only through syncboss and sysfs-redirect rules; anything else means something changed.
+    whys = refusals(cmd)
+    if (SB_WHY_DENY not in whys
+            or set(whys) - {SB_WHY_DENY, SB_WHY_ATTR, SB_WHY_REDIRECT, SB_WHY_WRITER, SYSFS_WHY}):
+        sys.exit(f"tools/dev: syncboss-txlen self-check failed ({whys}); refusing")
+    out, rc = _send(cmd, 10)
+    lines = out.split()
+    print(f"transaction_length: {' -> '.join(lines) if lines else '(no output)'}")
+    if rc or not lines or lines[-1] != str(SYNCBOSS_TXLEN):
+        sys.exit(f"tools/dev: syncboss-txlen failed (rc={rc}): {out.strip()[:200]}")
+
+
+def fw_fallback(mode):
+    if mode not in FW_FALLBACK_CMDS:
+        sys.exit("fw-fallback: on|off|status")
+    out, rc = run(FW_FALLBACK_CMDS[mode], 10)
+    vals = out.split()
+    want = {"off": "1", "on": "0"}.get(mode)
+    state = lambda v: f"{v} (sysfs fallback {'OFF' if v == '1' else 'ON' if v == '0' else '?'})"  # noqa: E731
+    print("ignore_sysfs_fallback: " + " -> ".join(state(v) for v in vals))
+    if rc or not vals or (want and vals[-1] != want):
+        sys.exit(f"tools/dev: fw-fallback {mode} failed (rc={rc}): {out.strip()[:200]}")
+
+
+# ---- fan test ----
+# Mainline pwm-fan: hwmon name "pwmfan", platform driver "pwm-fan". pwm1_enable is not a manual/auto switch
+# here, it selects what pwm1=0 does (0 hard off, 1 pwm off with supply on, 2 both on, 3 both off), so the
+# test requires pwm1_enable == 1, never changes it, and the trap writes it back only if it moved. The
+# thermal binding (cooling-levels <84 255>) only rewrites pwm1 when the 70 C fan trip is crossed, so pwm1 is
+# restored to its recorded value unless a zone reads >= 65 C (or none is readable); then it stays 255
+# (FAN_LEFT_255), because the governor would not raise 84 again above the trip. The hwmon is found by name
+# + driver, never by index; with anything but exactly one match nothing is written.
+# The command is several lines in one `( ... )` subshell because the shell's line editor cuts lines of
+# 1024+ bytes; ash parses the whole subshell before running it, so a cut connection runs nothing. Joined
+# with "; " the lines give the one-line text (tools/test_dev_denylist.py). @N@ = number of 2 s samples.
+FAN_TEST_TEMPLATE = (
+    "( H=; n=0; for h in /sys/class/hwmon/hwmon*; do d=$(readlink $h/device/driver); "
+    "if [ \"$(cat $h/name 2>/dev/null)\" = pwmfan ] && [ \"${d##*/}\" = pwm-fan ]; then H=$h; "
+    "n=$((n+1)); fi; done; if [ \"$n\" != 1 ]; then echo FAN_NOHWMON n=$n; exit 10; fi\n"
+    "E0=$(cat $H/pwm1_enable); P0=$(cat $H/pwm1); "
+    "echo FAN_HWMON=$H enable=$E0 pwm=$P0 rpm=$(cat $H/fan1_input) up=$(cut -d' ' -f1 /proc/uptime); "
+    "if [ \"$E0\" != 1 ]; then echo FAN_ENABLE_UNEXPECTED; exit 11; fi; "
+    "case \"$P0\" in [1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;; "
+    "*) echo FAN_PWM_UNEXPECTED; exit 12;; esac\n"
+    "RS=0; r() { if [ \"$RS\" = 1 ]; then return 0; fi; RS=1\n"
+    "if [ \"$(cat $H/pwm1_enable)\" != \"$E0\" ]; then echo \"$E0\" > \"$H/pwm1_enable\"; fi; "
+    "T=0; c=0; for z in /sys/class/thermal/thermal_zone*/temp; do v=$(cat $z 2>/dev/null); "
+    "case \"$v\" in ''|*[!0-9]*) ;; *) c=$((c+1)); if [ \"$v\" -gt \"$T\" ]; then T=$v; fi;; esac; done\n"
+    "if [ \"$P0\" != 255 ] && { [ \"$c\" = 0 ] || [ \"$T\" -ge 65000 ]; }; "
+    "then echo FAN_LEFT_255 tmax=$T zones=$c; else echo \"$P0\" > \"$H/pwm1\"; fi\n"
+    "echo FAN_RESTORED enable=$(cat $H/pwm1_enable) pwm=$(cat $H/pwm1) rpm=$(cat $H/fan1_input) "
+    "tmax=$T zones=$c; }\n"
+    "trap r EXIT; trap 'r; exit 13' HUP INT TERM; "
+    "echo 255 > \"$H/pwm1\"; echo FAN_SET rc=$? pwm=$(cat $H/pwm1)\n"
+    "i=0; while [ $i -lt @N@ ]; do sleep 2; i=$((i+1)); "
+    "echo FAN_S i=$i up=$(cut -d' ' -f1 /proc/uptime) rpm=$(cat $H/fan1_input) pwm=$(cat $H/pwm1); "
+    "done )")
+FAN_TEST_TEMPLATE_SHA256 = "157db45e0d5afd2e300249d9a8b2abb34c67ec86eada95d129da253558eb1097"
+FAN_TEST_MIN, FAN_TEST_MAX = 4, 60      # s; samples = SECONDS // 2
+FAN_TEST_SET = 255
+FAN_RISE_MIN = 500                      # rpm above the before-reading, and >= 1.2x it
+# The denylist refuses the composed command (it writes sysfs through $H) for exactly these rules; anything
+# else means the string or the denylist changed.
+FAN_TEST_TARGETS = ["$H/pwm1_enable", "$H/pwm1", "$H/pwm1"]
+GLOB_WRITE_WHY = "glob character in a command that writes (spell the path out)"
+FAN_TEST_WHYS = {COMPUTED_WHY, GLOB_WRITE_WHY}
+
+
+def fan_test_cmd(seconds):
+    """The composed device command for SECONDS, or SystemExit (bounds, pin, self-check)."""
+    if not isinstance(seconds, int) or isinstance(seconds, bool) \
+            or not FAN_TEST_MIN <= seconds <= FAN_TEST_MAX:
+        sys.exit(f"tools/dev: fan-test SECONDS must be an integer {FAN_TEST_MIN}..{FAN_TEST_MAX}")
+    if hashlib.sha256(FAN_TEST_TEMPLATE.encode()).hexdigest() != FAN_TEST_TEMPLATE_SHA256 \
+            or FAN_TEST_TEMPLATE.count("@N@") != 1:
+        sys.exit("tools/dev: fan-test command was modified; refusing")
+    cmd = FAN_TEST_TEMPLATE.replace("@N@", str(seconds // 2))
+    whys = set(refusals(cmd))
+    targets = [t for t in _redirect_targets(cmd) if t != "/dev/null"]
+    if whys != FAN_TEST_WHYS or targets != FAN_TEST_TARGETS:
+        sys.exit(f"tools/dev: fan-test self-check failed (refusals {sorted(whys)}, write targets "
+                 f"{targets}); refusing")
+    return cmd
+
+
+def parse_fan_test(out):
+    """dict(before, samples, restored, left255, set_rc, error) from the device output."""
+    r = dict(before=None, samples=[], restored=None, left255=None, set_rc=None, error=None)
+    for line in out.splitlines():
+        kv = dict(t.partition("=")[::2] for t in line.split() if "=" in t)
+        w = line.split()[0] if line.split() else ""
+        if w.startswith("FAN_HWMON="):
+            r["before"] = kv
+        elif w in ("FAN_NOHWMON", "FAN_ENABLE_UNEXPECTED", "FAN_PWM_UNEXPECTED"):
+            r["error"] = line.strip()
+        elif w == "FAN_SET":
+            r["set_rc"] = kv.get("rc")
+        elif w == "FAN_S":
+            r["samples"].append(kv)
+        elif w == "FAN_LEFT_255":
+            r["left255"] = kv
+        elif w == "FAN_RESTORED":
+            r["restored"] = kv
+    return r
+
+
+def _int(v):
+    return int(v) if v is not None and re.fullmatch(r"\d+", v) else None
+
+
+def fan_test(seconds):
+    """Exit 0: rpm rose and pwm1_enable/pwm1 are back to their recorded values.
+    2: nothing written (no unique pwm-fan hwmon, unexpected mode/value, or no reply at all).
+    3: rpm did not rise (abort the test). 4: restore not confirmed.
+    5: rpm rose, but pwm1 was left at 255 because a zone read >= 65 C (fail-safe).
+    6: transport timeout (the device loop still ends and restores by itself)."""
+    cmd = fan_test_cmd(seconds)
+    try:
+        out, rc = _send(cmd, 2 * (seconds // 2) + 30)
+    except (OSError, TimeoutError) as e:
+        print(f"tools/dev: fan-test: no complete reply ({e!r}). The device-side loop ends by "
+              f"itself within {seconds} s and its trap restores pwm1_enable/pwm1; check with "
+              f"the H5 read before anything else.")
+        return 6
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+    r = parse_fan_test(out)
+    if r["error"] or r["before"] is None:
+        print(f"fan-test: nothing written ({r['error'] or 'no FAN_HWMON line'}; rc={rc})")
+        return 2
+    b = r["before"]
+    rpm0 = _int(b.get("rpm"))
+    rpms = [x for x in (_int(s.get("rpm")) for s in r["samples"]) if x is not None]
+    rmax = max(rpms) if rpms else None
+    rose = (rpm0 is not None and rmax is not None
+            and rmax >= rpm0 + FAN_RISE_MIN and rmax * 5 >= rpm0 * 6)
+    res = r["restored"] or {}
+    want_pwm = str(FAN_TEST_SET) if r["left255"] else b.get("pwm")
+    restored = bool(res) and res.get("enable") == b.get("enable") and res.get("pwm") == want_pwm
+    print(f"fan-test: {b.get('FAN_HWMON')} before enable={b.get('enable')} pwm={b.get('pwm')} "
+          f"rpm={rpm0}; at pwm {FAN_TEST_SET}: {len(rpms)} samples, max rpm {rmax}; set rc="
+          f"{r['set_rc']}; after enable={res.get('enable')} pwm={res.get('pwm')} "
+          f"rpm={res.get('rpm')} tmax={res.get('tmax')}; device rc={rc}")
+    if not restored:
+        print("fan-test: RESTORE NOT CONFIRMED: read H5 now (pwm1 255 is the safe direction)")
+        return 4
+    if not rose:
+        print(f"fan-test: RPM DID NOT RISE (need >= before + {FAN_RISE_MIN} and >= 1.2x)")
+        return 3
+    if r["left255"]:
+        print(f"fan-test: rpm rose; pwm1 LEFT AT 255 (a zone read >= 65 C or none was readable)")
+        return 5
+    print("fan-test: rpm rose; pwm1_enable and pwm1 restored")
+    return 0
+
+
+# ---- stepped CPU load with a host-side thermal guard ----------
+# Load = busybox `yes > /dev/null` workers, one per listed CPU, bounded on the device by `timeout SECS`
+# (ends even if the host or link dies), under nohup and nice 19 so telnet and heartbeat stay responsive.
+# $! is the `yes` PID itself (checked in tools/test_fan_sim.py), so a stop is a plain `kill PID...`.
+# The guard samples every LOAD_EVERY s with one fixed read-only command and stops the load on any
+# threshold below. --cores 0 = sampling only.
+LOAD_CPUS = {0: "", 1: "4", 2: "4 5", 4: "4 5 6 7", 8: "0 1 2 3 4 5 6 7"}   # 4-7 = A77 (7 prime)
+LOAD_MIN_S, LOAD_MAX_S = 30, 300
+LOAD_EVERY = 15
+LOAD_START_TEMPLATE = ("for c in @CPUS@; do nohup nice -n 19 taskset -c $c timeout @SECS@ yes "
+                       "> /dev/null 2>&1 & echo pid=$!; done; echo END")
+LOAD_SAMPLE_CMD = ("echo up=$(cut -d' ' -f1 /proc/uptime); for z in /sys/class/thermal/thermal_zone*; "
+                   "do echo z $(cat $z/type) $(cat $z/temp 2>/dev/null); done; "
+                   "for h in /sys/class/hwmon/hwmon*; do echo h $(cat $h/name) "
+                   "rpm=$(cat $h/fan1_input 2>/dev/null) pwm=$(cat $h/pwm1 2>/dev/null); done; "
+                   "cd /sys/class/power_supply/bq27z561-0 2>/dev/null && echo g cap=$(cat capacity) "
+                   "temp=$(cat temp) uv=$(cat voltage_now) ua=$(cat current_now) uah=$(cat charge_now); "
+                   "for p in $(pidof yes); do echo y $p $(cut -d' ' -f3 /proc/$p/stat 2>/dev/null); done; "
+                   "echo END")
+LOAD_ZONE_STOP = 78000       # m°C: stop (2 °C under an 80 °C hard limit: 15-s sampling)
+LOAD_FAN_TRIP = 70000        # m°C: the DT fan trip (cooling-levels <84 255>)
+LOAD_FAN_FRACTION = 0.85     # of the fan-test rpm at 255, once >= the trip for two samples
+LOAD_GAUGE_TEMP_STOP = 420   # 0.1 °C: battery gauge over 42.0 °C
+LOAD_CAPACITY_STOP = 45      # %: stop the load
+LOAD_EXIT = dict(ok=0, zone=10, fan=11, gauge_temp=12, capacity=13, samples=14, load=15,
+                 kill_failed=20)
+
+
+def load_start_cmd(cores, seconds):
+    if isinstance(cores, bool) or not isinstance(cores, int) or cores not in LOAD_CPUS or cores == 0:
+        sys.exit("tools/dev: load-step --cores must be 1, 2, 4 or 8 (0 = sample only)")
+    if not isinstance(seconds, int) or isinstance(seconds, bool) or not LOAD_MIN_S <= seconds <= LOAD_MAX_S:
+        sys.exit(f"tools/dev: load-step --seconds must be an integer {LOAD_MIN_S}..{LOAD_MAX_S}")
+    return LOAD_START_TEMPLATE.replace("@CPUS@", LOAD_CPUS[cores]).replace("@SECS@", str(seconds))
+
+
+def parse_load_sample(out):
+    """dict(up, zones[(type, mC|None)], fan(rpm, pwm)|None, gauge{...}|None, yes{live pids})."""
+    if "END" not in out.split():
+        raise ValueError(f"incomplete sample: {out.strip()[:120]!r}")
+    s = dict(up=None, zones=[], fan=None, fans=0, gauge=None, yes=set())
+    for line in out.splitlines():
+        w = line.split()
+        if not w:
+            continue
+        if w[0].startswith("up="):
+            s["up"] = w[0][3:]
+        elif w[0] == "z" and len(w) >= 2:
+            s["zones"].append((w[1], int(w[2]) if len(w) > 2 and re.fullmatch(r"-?\d+", w[2]) else None))
+        elif w[0] == "h" and len(w) >= 2 and w[1] == "pwmfan":
+            s["fans"] += 1
+            kv = dict(x.partition("=")[::2] for x in w[2:])
+            s["fan"] = tuple(int(kv[k]) if re.fullmatch(r"\d+", kv.get(k, "")) else None
+                             for k in ("rpm", "pwm"))
+        elif w[0] == "g":
+            kv = dict(x.partition("=")[::2] for x in w[1:])
+            s["gauge"] = {k: int(kv[k]) if re.fullmatch(r"-?\d+", kv.get(k, "")) else None
+                          for k in ("cap", "temp", "uv", "ua", "uah")}
+        elif w[0] == "y" and len(w) >= 3 and w[1].isdigit() and w[2] not in ("Z", "X"):
+            s["yes"].add(int(w[1]))       # zombies (reaped later by the init) do not count
+    if not any(t is not None for _, t in s["zones"]):
+        raise ValueError("no readable thermal zone")
+    return s
+
+
+def load_verdict(s, prev, fan255):
+    """(reason, text) if the sample breaks a threshold, else None. Pure."""
+    zs = [(t, n) for n, t in s["zones"] if t is not None]
+    tmax, zmax = max(zs)
+    if tmax >= LOAD_ZONE_STOP:
+        return "zone", f"zone {zmax} at {tmax / 1000:.1f} C >= {LOAD_ZONE_STOP / 1000:.0f} C"
+    rpm, pwm = s["fan"] if s["fan"] and s["fans"] == 1 else (None, None)
+    if not rpm:
+        return "fan", f"fan rpm unreadable or 0 (pwmfan hwmons: {s['fans']}, fan1_input {rpm})"
+    ptmax = max((t for _, t in prev["zones"] if t is not None), default=0) if prev else 0
+    if tmax >= LOAD_FAN_TRIP and ptmax >= LOAD_FAN_TRIP:
+        need = int(fan255 * LOAD_FAN_FRACTION) if fan255 else None
+        if pwm != 255 or (need and rpm < need):
+            return "fan", (f"zones >= {LOAD_FAN_TRIP / 1000:.0f} C for two samples but fan pwm1 {pwm}, "
+                           f"{rpm} rpm (need pwm 255{f' and >= {need} rpm' if need else ''})")
+    g = s["gauge"]
+    if g and g["temp"] is not None and g["temp"] > LOAD_GAUGE_TEMP_STOP:
+        return "gauge_temp", f"battery gauge {g['temp'] / 10:.1f} C > {LOAD_GAUGE_TEMP_STOP / 10:.1f} C"
+    if g and g["cap"] is not None and g["cap"] < LOAD_CAPACITY_STOP:
+        return "capacity", f"battery gauge {g['cap']} % < {LOAD_CAPACITY_STOP} %"
+    return None
+
+
+def _load_line(s):
+    zs = [(t, n) for n, t in s["zones"] if t is not None]
+    tmax, zmax = max(zs)
+    g = s["gauge"] or {}
+    rpm, pwm = s["fan"] or (None, None)
+    return (f"{time.strftime('%H:%M:%S')} up={s['up']} tmax={tmax / 1000:.1f}({zmax}) "
+            f"fan={rpm}/{pwm} batt={g.get('cap')}%/{g.get('temp')}dC/{g.get('uv')}uV/"
+            f"{g.get('ua')}uA/{g.get('uah')}uAh yes={len(s['yes'])} zones="
+            + ",".join(f"{n}:{t}" for n, t in s["zones"]))
+
+
+def load_step(cores, seconds, fan255=None, log=None):
+    """Run one bounded load step (or sampling only) under the guard; see LOAD_EXIT."""
+    if cores == 0:
+        if not isinstance(seconds, int) or not LOAD_MIN_S <= seconds <= LOAD_MAX_S:
+            sys.exit(f"tools/dev: load-step --seconds must be an integer {LOAD_MIN_S}..{LOAD_MAX_S}")
+        start_cmd = None
+    else:
+        start_cmd = load_start_cmd(cores, seconds)
+    if fan255 is not None and not 1000 <= fan255 <= 20000:
+        sys.exit("tools/dev: load-step --fan255 must be the fan-test max rpm (1000..20000)")
+
+    def emit(msg):
+        print(msg, flush=True)
+        if log:
+            _append_line(log, msg)
+
+    def sample():
+        return parse_load_sample(run(LOAD_SAMPLE_CMD, 20)[0])
+
+    pids = []
+
+    def stop(reason, text):
+        emit(f"load-step: STOP ({reason}): {text}")
+        if pids:
+            alive = sorted(set(pids))
+            for kcmd in ("kill " + " ".join(map(str, alive)), "kill -9 " + " ".join(map(str, alive))):
+                try:
+                    run(kcmd, 15)
+                    _sleep(2)
+                    left = sorted(sample()["yes"] & set(pids))
+                except (OSError, TimeoutError, ValueError) as e:
+                    left = alive
+                    emit(f"load-step: stop check failed ({e!r})")
+                emit(f"load-step: sent `{kcmd}`; still running: {left or 'none'}")
+                if not left:
+                    break
+                alive = left
+            else:
+                emit("load-step: LOAD NOT STOPPED: LONG-PRESS NOW")
+                return LOAD_EXIT["kill_failed"]
+        return LOAD_EXIT[reason]
+
+    prev, fails = None, 0
+    try:
+        prev = sample()
+    except (OSError, TimeoutError, ValueError) as e:
+        emit(f"load-step: first sample failed ({e!r}); nothing started")
+        return LOAD_EXIT["samples"]
+    emit(_load_line(prev))
+    v = load_verdict(prev, None, fan255)
+    if v:
+        emit(f"load-step: not started ({v[0]}): {v[1]}")
+        return LOAD_EXIT[v[0]]
+    if prev["yes"]:
+        emit(f"load-step: yes already running ({sorted(prev['yes'])}); nothing started")
+        return LOAD_EXIT["load"]
+    t0 = _now()
+    if start_cmd:
+        out, rc = run(start_cmd, 20)
+        got = [int(x[4:]) for x in out.split() if re.fullmatch(r"pid=\d+", x)]
+        pids = [p for p in got if p > 1]
+        emit(f"load-step: started {cores} worker(s) on CPUs {LOAD_CPUS[cores]} for {seconds}s: "
+             f"pids {' '.join(map(str, pids))} (rc={rc}); stop by hand: tools/dev sh 'kill "
+             f"{' '.join(map(str, pids))}'")
+        if rc or len(got) != cores or len(pids) != cores:
+            return stop("load", f"start reply not as expected: {out.strip()[:200]!r}")
+    k = 1
+    while True:
+        due = t0 + k * LOAD_EVERY
+        end = seconds + 3
+        if due - t0 > end:
+            due = t0 + end
+        _sleep(max(0.0, due - _now()))
+        try:
+            s = sample()
+            fails = 0
+        except (OSError, TimeoutError, ValueError) as e:
+            fails += 1
+            emit(f"load-step: sample failed ({e!r}) [{fails}/2]")
+            if fails >= 2:
+                return stop("samples", "two consecutive sample failures")
+            k += 1
+            continue
+        emit(_load_line(s))
+        v = load_verdict(s, prev, fan255)
+        if v:
+            return stop(*v)
+        prev = s
+        if due - t0 >= end:
+            left = sorted(s["yes"] & set(pids))
+            if left:
+                return stop("load", f"workers still running after {seconds}s: {left}")
+            emit(f"load-step: done ({cores} cores, {seconds}s); workers ended by their timeout")
+            return LOAD_EXIT["ok"]
+        if pids and _now() - t0 < seconds - 2 and not set(pids) <= s["yes"]:
+            emit(f"load-step: workers gone early: {sorted(set(pids) - s['yes'])}")
+            return stop("load", "a worker ended before its timeout")
+        k += 1
+
+
+# ---- gauge drain samples -------------------------------------------------------
+# One read-only gauge line per call. Drain rate only means something between samples a minute or more
+# apart, so the spacing is enforced from the log's last `DRAIN epoch=` line (host clock).
+GAUGE = "/sys/class/power_supply/bq27z561-0"
+DRAIN_CMD = (f"echo $(cut -d' ' -f1 /proc/uptime) $(cat {GAUGE}/capacity) $(cat {GAUGE}/voltage_now) "
+             f"$(cat {GAUGE}/current_now) $(cat {GAUGE}/charge_now) $(cat {GAUGE}/temp)")
+DRAIN_GAP = 60.0         # s between two samples in one drain log
+DRAIN_REC = re.compile(r"^DRAIN epoch=(\d+(?:\.\d+)?) ")
+
+
+def _log_path(log, default_name):
+    """The log file to append to: LOG (any path) or LOG_DIR/default_name."""
+    return log or os.path.join(LOG_DIR, default_name)
+
+
+def _append_line(path, line):
+    """Append one line to the log file, creating its directory on first use."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        sys.exit(f"tools/dev: cannot write the log {path}: {e}")
+
+
+def drain(log):
+    """One drain sample into LOG, at least DRAIN_GAP after LOG's previous one (waits out the rest)."""
+    log = _log_path(log, "drain.log")
+    last = None
+    if os.path.exists(log):
+        with open(log, errors="replace") as f:
+            for line in f:
+                m = DRAIN_REC.match(line)
+                if m:
+                    last = float(m.group(1))
+    now = _wall()
+    gap = None if last is None else now - last
+    if gap is not None and gap < DRAIN_GAP:
+        wait = DRAIN_GAP if gap < 0 else DRAIN_GAP - gap      # clock went back: the full gap
+        print(f"drain: previous sample {gap:.0f} s ago; waiting {wait:.0f} s for the >= {DRAIN_GAP:.0f} s spacing",
+              flush=True)
+        _sleep(wait)
+    try:
+        out, rc = run(DRAIN_CMD, 20)
+    except (OSError, TimeoutError) as e:
+        sys.exit(f"tools/dev: drain sample failed ({e!r}); nothing logged")
+    t = _wall()
+    body = " | ".join(l.strip() for l in out.strip().splitlines() if l.strip()) or "(no output)"
+    rec = (f"DRAIN epoch={t:.1f} at={time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(t))} "
+           f"gap={'-' if last is None else f'{t - last:.0f}s'} rc={rc} up_cap_uv_ua_uah_dC={body}")
+    _append_line(log, rec)
+    print(rec, flush=True)
+    return 1 if rc else 0
+
+
+# ---- heartbeat dead-man ---------------------------------------------------
+HB_LOOP_MIN, HB_LOOP_MAX = 10, 300
+HB_MAX_DURATION_DEFAULT, HB_MAX_DURATION_MAX = 3600, 14400
+_sleep = time.sleep      # test hooks
+_now = time.monotonic
+_wall = time.time
+
+
+def parse_heartbeat(out):
+    """Parse HEARTBEAT_CMD output -> dict(hb, timeout, pid, prev_deadline, prev_heartbeat,
+    reset). Raises ValueError if it isn't a mainline lvr-init with a heartbeat dead-man."""
+    kv = {}
+    for tok in out.replace("\n", " ").split():
+        k, eq, v = tok.partition("=")
+        if eq and k not in kv:
+            kv[k] = v
+    reset = re.search(r"^reset=(.*)$", out, re.M)
+    if "END" not in out.split() or not reset:
+        raise ValueError(f"incomplete reply: {out.strip()[:200]!r}")
+    if not re.fullmatch(r"\d+(\.\d+)?", kv.get("hb", "")):
+        raise ValueError(f"target uptime not written to /tmp/lvr-heartbeat: {out.strip()[:200]!r}")
+    if not re.fullmatch(r"\d+", kv.get("timeout", "")):
+        raise ValueError("no /tmp/lvr-deadman timeout: the target is not the mainline lvr-init "
+                         "(heartbeat dead-man); nothing to refresh")
+    return dict(hb=float(kv["hb"]), timeout=int(kv["timeout"]), pid=kv.get("pid"),
+                prev_deadline=kv.get("deadline_uptime"), prev_heartbeat=kv.get("heartbeat"),
+                reset=reset.group(1).strip())
+
+
+def heartbeat_once():
+    """Send HEARTBEAT_CMD once (denylist-checked by run()); exit non-zero on any failure."""
+    if refusals(HEARTBEAT_CMD):
+        sys.exit(f"tools/dev: heartbeat command refused ({refusals(HEARTBEAT_CMD)}); refusing")
+    try:
+        out, rc = run(HEARTBEAT_CMD, 10)
+    except (OSError, TimeoutError) as e:
+        sys.exit(f"tools/dev: heartbeat failed ({e!r}); the target resets lvr_deadman s after "
+                 f"its last accepted heartbeat")
+    try:
+        info = parse_heartbeat(out)
+    except ValueError as e:
+        sys.exit(f"tools/dev: heartbeat failed (rc={rc}): {e}")
+    if info["reset"]:
+        sys.exit(f"tools/dev: RESET ALREADY ARMED on the target ({info['reset']}); a heartbeat "
+                 f"can't cancel it: expect the watchdog bite within ~30 s of that uptime")
+    if rc:
+        sys.exit(f"tools/dev: heartbeat failed (rc={rc}): {out.strip()[:200]}")
+    up = int(info["hb"])
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} heartbeat: target uptime {up}s, "
+          f"timeout {info['timeout']}s -> reset at uptime >= {up + info['timeout']}s unless "
+          f"refreshed (dead-man before this one: deadline {info['prev_deadline']}, "
+          f"heartbeat {info['prev_heartbeat']})", flush=True)
+    return info
+
+
+def heartbeat(loop=None, max_duration=HB_MAX_DURATION_DEFAULT):
+    if loop is None:
+        heartbeat_once()
+        return
+    if not HB_LOOP_MIN <= loop <= HB_LOOP_MAX:
+        sys.exit(f"tools/dev: --loop must be {HB_LOOP_MIN}..{HB_LOOP_MAX} s")
+    if not loop <= max_duration <= HB_MAX_DURATION_MAX:
+        sys.exit(f"tools/dev: --max-duration must be --loop..{HB_MAX_DURATION_MAX} s")
+    start = _now()
+    print(f"heartbeat loop: pid {os.getpid()}, every {loop:g}s, at most {max_duration:g}s; "
+          f"stop with `kill {os.getpid()}` when done", flush=True)
+    try:
+        while True:
+            info = heartbeat_once()
+            if loop * 2 > info["timeout"]:
+                sys.exit(f"tools/dev: --loop {loop:g} is more than half the target's dead-man "
+                         f"timeout ({info['timeout']}s); stopping")
+            if _now() - start + loop > max_duration:
+                print(f"heartbeat loop: --max-duration {max_duration:g}s reached; stopped. The "
+                      f"target resets {info['timeout']}s after this heartbeat unless refreshed.",
+                      flush=True)
+                return
+            _sleep(loop)
+    except KeyboardInterrupt:
+        print("heartbeat loop: interrupted; stopped", flush=True)
+
+
+# ---- return to Android ----
+# Read-only probe: kernel release and whether the mainline init (dead-man) runs. It also reads the warm-reset
+# trigger (a read never resets). If the trigger is `armed` and RETURN_LOST_PRESUMED polls go unanswered
+# after the request, the warm reset beat the 1 s poll: "warm reset presumed" (exit 0); the pstore console
+# log after the return confirms it.
+RETURN_PROBE = ("echo kernel=$(uname -r); cat /tmp/lvr-deadman 2>/dev/null; "
+                "echo reset=$(cat /tmp/lvr-reset/reason 2>/dev/null); "
+                "echo wdt=$(cat /tmp/lvr-reset/device 2>/dev/null); "
+                "echo warm=$(cat /tmp/lvr-warm 2>/dev/null); "
+                "echo trig=$(cat /proc/lvr_warm_reset 2>/dev/null); echo END")
+RETURN_LOST_PRESUMED = 5
+# The only command that creates the return request; the init's dead-man loop sees it within one 5 s pass.
+# If /proc/lvr_warm_reset reads `armed` the init logs LVR-WARM-MARKER, writes /tmp/lvr-warm, syncs and
+# writes `r` to the trigger (PON warm reset + PS_HOLD drop, the driver's WDT as backstop); if still up 10 s
+# later it falls back to force_reset (hold qcom_wdt open unwritten; bite ~30 s later). Trigger missing or
+# not armed: force_reset at once. No reboot(2): it hangs in TrustZone. Refused everywhere else (LVR_STATE).
+RETURN_CMD = ("touch /tmp/lvr-return && echo return=requested; "
+              "echo reset=$(cat /tmp/lvr-reset/reason 2>/dev/null); echo END")
+RETURN_CMD_PINNED = ("touch /tmp/lvr-return && echo return=requested; "
+                     "echo reset=$(cat /tmp/lvr-reset/reason 2>/dev/null); echo END")
+RETURN_POLL = ("echo reset=$(cat /tmp/lvr-reset/reason 2>/dev/null); "
+               "echo wdt=$(cat /tmp/lvr-reset/device 2>/dev/null); "
+               "echo warm=$(cat /tmp/lvr-warm 2>/dev/null); echo END")
+RETURN_REASON = "return-android requested"
+RETURN_WAIT = 30         # s: one init pass (5 s sleep + pass time) + the init's 10 s clean-reboot
+#                          wait before its watchdog fallback, with margin
+RETURN_POLL_EVERY = 1.0
+
+
+def parse_kv(out):
+    """key=value lines of a fixed reply ending in END -> dict (first value wins)."""
+    if "END" not in out.split():
+        raise ValueError(f"incomplete reply: {out.strip()[:200]!r}")
+    kv = {}
+    for line in out.splitlines():
+        for tok in ([line] if line.startswith(("reset=", "wdt=", "kernel=", "warm=", "trig=")) else line.split()):
+            k, eq, v = tok.partition("=")
+            if eq and k not in kv:
+                kv[k] = v.strip()
+    return kv
+
+
+def return_android(kexec_dir=None):
+    try:
+        probe = parse_kv(run(RETURN_PROBE, 10)[0])
+    except (OSError, TimeoutError, ValueError) as e:
+        sys.exit(f"tools/dev: return-android: target probe failed ({e}); nothing sent. "
+                 f"Fall back to the long power-button press.")
+    kernel = probe.get("kernel", "")
+    mainline = re.fullmatch(r"\d+", probe.get("timeout", "")) is not None
+    if kernel.startswith("4.19.") and not mainline:
+        # Downstream quest-kexec boot: that project's return script does the reset.
+        kexec = kexec_dir or os.environ.get(KEXEC_DIR_ENV)
+        if not kexec:
+            sys.exit(f"tools/dev: return-android: the target runs the downstream quest-kexec boot, "
+                     f"whose return script lives in a quest-kexec checkout "
+                     f"(https://github.com/Mac898/quest-kexec). Set {KEXEC_DIR_ENV}=DIR or pass "
+                     f"--kexec-dir DIR. Nothing sent.")
+        script = os.path.join(kexec, "tools", "return-android.sh")
+        if not os.path.isfile(script):
+            sys.exit(f"tools/dev: return-android: {script} not found; is {kexec} a quest-kexec checkout? "
+                     f"Nothing sent.")
+        print(battery())
+        return subprocess.call([script], cwd=kexec)
+    if not mainline or kernel.startswith("4."):
+        sys.exit(f"tools/dev: return-android: target is neither the downstream kexec boot nor the "
+                 f"mainline lvr-init (kernel={kernel!r}, lvr-deadman={probe.get('timeout')!r}); "
+                 f"nothing sent. Fall back to the long power-button press.")
+    try:
+        print(battery())
+    except (OSError, TimeoutError, ValueError):
+        print("battery: not readable on this kernel; use the Android readings before the jump "
+              "and after the return")
+    if probe.get("warm") and not probe.get("reset"):
+        print(f"return-android: a warm reset is already in progress ({probe['warm']}); nothing sent")
+        return 0
+    if probe.get("reset"):
+        print(f"return-android: a reset is already armed ({probe['reset']}; watchdog "
+              f"{probe.get('wdt') or 'NOT held'}); nothing sent")
+        return 0 if probe.get("wdt") else 1
+    if RETURN_CMD != RETURN_CMD_PINNED or refusals(RETURN_CMD) != [LVR_WHY]:
+        sys.exit(f"tools/dev: return-android command or its denylist self-check changed "
+                 f"({refusals(RETURN_CMD)}); refusing")
+    try:
+        out, rc = _send(RETURN_CMD, 10)
+    except (OSError, TimeoutError) as e:
+        sys.exit(f"tools/dev: return-android: request not confirmed ({e}). If it arrived, the "
+                 f"init resets within ~35 s; otherwise long-press.")
+    if rc or "return=requested" not in out.split():
+        sys.exit(f"tools/dev: return-android: request failed (rc={rc}): {out.strip()[:200]}")
+    print(f"return-android: request sent to the mainline lvr-init (kernel {kernel}); waiting "
+          f"<= {RETURN_WAIT}s for its clean reboot or watchdog-bite reset path", flush=True)
+    start = _now()
+    last = {}
+    warm = ""
+    lost = 0             # consecutive failed polls since the last reply
+    trig_armed = probe.get("trig", "") == "armed"
+    while _now() - start < RETURN_WAIT:
+        _sleep(RETURN_POLL_EVERY)
+        try:
+            last = parse_kv(run(RETURN_POLL, 10)[0])
+        except (OSError, TimeoutError, ValueError):
+            lost += 1
+            if (warm and lost >= 3) or (trig_armed and lost >= RETURN_LOST_PRESUMED):
+                break
+            continue
+        lost = 0
+        warm = warm or last.get("warm", "")
+        if last.get("reset") and last.get("wdt"):
+            break
+    reason, wdt = last.get("reset", ""), last.get("wdt", "")
+    if reason and wdt:
+        how = "" if reason.startswith(RETURN_REASON) else " (another reset path was first)"
+        if warm:
+            fb = (" The warm reset trigger returned and the device was still up after the init's 10 s "
+                  "(watchdog fallback; cold return expected).")
+        elif reason.startswith(RETURN_REASON):
+            fb = (" No warm reset tried: the init found /proc/lvr_warm_reset missing or not `armed` "
+                  "(its reason is in `tools/dev log`), or the init predates the warm-reset path; cold return expected.")
+        else:
+            fb = ""
+        print(f"return-android: reset armed{how}: {reason}; {wdt} held open, never written.{fb} "
+              f"Expect the watchdog bite ~30 s after that uptime, then Android. "
+              f"A running `tools/dev heartbeat --loop` stops at its next beat.")
+        return 0
+    if reason:
+        sys.exit(f"tools/dev: return-android: reset armed ({reason}) but no watchdog held: "
+                 f"the init cannot self-reset; long power-button press needed")
+    if warm:
+        print(f"return-android: clean reboot issued (warm reset trigger /proc/lvr_warm_reset written: "
+              f"{warm}); link lost after it, as expected. Expect Android; after a warm "
+              f"reset the mainline console-ramoops survives (LVR-WARM-MARKER line) and Android's PON "
+              f"reason says 'warm'. 'cold' + empty pstore = the driver's 2 s WDT backstop or the init's "
+              f"fallback (~40 s after that uptime) fired instead. No Android: long-press. A running "
+              f"`tools/dev heartbeat --loop` stops at its next beat.")
+        return 0
+    if lost >= RETURN_LOST_PRESUMED and trig_armed:
+        print(f"return-android: warm reset presumed: /proc/lvr_warm_reset read `armed` before the request, the "
+              f"request was confirmed, and the target has not answered for the last {lost} poll(s) (no reset or "
+              f"warm-reset state seen: the warm reset was quicker than one poll). Not yet confirmed: "
+              f"the pstore console log after the return is the confirmation (LVR-WARM-MARKER present = warm reset; "
+              f"absent = the driver's 2 s WDT backstop or the init's fallback fired). Expect "
+              f"Android; no Android after 2 min: long-press. A running `tools/dev heartbeat "
+              f"--loop` stops at its next beat.")
+        return 0
+    if lost:
+        sys.exit(f"tools/dev: return-android: no reply for the last {lost} poll(s) and no reset or "
+                 f"warm-reset state seen: consistent with a clean reboot (warm trigger) before the "
+                 f"first poll, but unconfirmed (trigger at the probe: {probe.get('trig') or 'not read'}). Check "
+                 f"that Android comes back; otherwise long-press. The pstore console log decides what happened.")
+    sys.exit(f"tools/dev: return-android: the init did not act within {RETURN_WAIT}s (an init "
+             f"without the /tmp/lvr-return poll?). The dead-man still resets lvr_deadman s after "
+             f"the last heartbeat (stop the heartbeat loop), or long-press.")
+
+
+# ---- fixed commands: cpufreq cap, modules, same-DT self-kexec ----
+# Fixed text (sha256-pinned where it writes) with only validated literals as variable parts. Those the
+# denylist refuses in free form (sysfs write, insmod/rmmod, kexec, watchdog open) are sent only after a
+# self-check that it refuses them for exactly the expected reasons; anything else means the string or the
+# denylist changed and the command is refused. Every line stays under LINE_MAX.
+
+def _fixed_send(label, cmd, whys, timeout, targets=None, allow_modules=False):
+    """Send fixed text cmd after the self-check: refusals == whys (a set; empty = must pass the
+    denylist) and, if given, the literal write targets (except /dev/null) == targets."""
+    got = set(refusals(cmd, allow_modules))
+    tg = [t for t in _redirect_targets(cmd) if t != "/dev/null"]
+    if got != set(whys) or (targets is not None and tg != list(targets)):
+        sys.exit(f"tools/dev: {label} self-check failed (refusals {sorted(got)}, write targets {tg}); "
+                 f"refusing")
+    return _send(cmd, timeout)
+
+
+# -- cpufreq-cap --
+# Sets scaling_max_freq of gold (policy4, CPUs 4-6) and prime (policy7, CPU 7) to the 90 C floors
+# 1478400 / 1075200, or back to cpuinfo_max 2419200 / 2841600. One subshell, four lines: record every
+# policy; precheck (related_cpus, scaling_driver qcom-cpufreq-hw, cpuinfo_max_freq; no write on any
+# mismatch); the two writes; readback, non-zero exit unless both read the written values. policy0 is
+# never written.
+CF_DIR = "/sys/devices/system/cpu/cpufreq"
+CPUFREQ_CAP_TEMPLATE = (
+    "( P=/sys/devices/system/cpu/cpufreq; for p in 0 4 7; do echo CF_POLICY$p "
+    "rel=$(cat $P/policy$p/related_cpus | tr ' ' ,) drv=$(cat $P/policy$p/scaling_driver) "
+    "gov=$(cat $P/policy$p/scaling_governor) max=$(cat $P/policy$p/scaling_max_freq) "
+    "cmax=$(cat $P/policy$p/cpuinfo_max_freq) cur=$(cat $P/policy$p/cpuinfo_cur_freq); done\n"
+    "if [ \"$(cat $P/policy4/related_cpus)\" != \"4 5 6\" ] || [ \"$(cat $P/policy7/related_cpus)\" != 7 ] || "
+    "[ \"$(cat $P/policy4/scaling_driver)\" != qcom-cpufreq-hw ] || "
+    "[ \"$(cat $P/policy7/scaling_driver)\" != qcom-cpufreq-hw ] || "
+    "[ \"$(cat $P/policy4/cpuinfo_max_freq)\" != 2419200 ] || [ \"$(cat $P/policy7/cpuinfo_max_freq)\" != 2841600 ]; "
+    "then echo CF_PRECHECK_FAIL; exit 10; fi\n"
+    "echo @G@ > /sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq; echo CF_SET4 rc=$?; "
+    "echo @P@ > /sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq; echo CF_SET7 rc=$?\n"
+    "g=$(cat $P/policy4/scaling_max_freq); q=$(cat $P/policy7/scaling_max_freq); "
+    "echo CF_AFTER policy0=$(cat $P/policy0/scaling_max_freq) policy4=$g policy7=$q "
+    "cur4=$(cat $P/policy4/cpuinfo_cur_freq) cur7=$(cat $P/policy7/cpuinfo_cur_freq); "
+    "if [ \"$g\" = @G@ ] && [ \"$q\" = @P@ ]; then echo CF_OK; else echo CF_MISMATCH; exit 11; fi )")
+CPUFREQ_CAP_TEMPLATE_SHA256 = "492dbd65c90f8dbb853e97ccabb829f21e988654f08baa4994faf35be86b8f3b"
+CPUFREQ_CAP_VALUES = {"cap": (1478400, 1075200), "uncap": (2419200, 2841600)}
+CPUFREQ_CAP_TARGETS = [f"{CF_DIR}/policy4/scaling_max_freq", f"{CF_DIR}/policy7/scaling_max_freq"]
+CPUFREQ_STATUS_CMD = (
+    "P=/sys/devices/system/cpu/cpufreq; for p in 0 4 7; do echo CF_POLICY$p "
+    "rel=$(cat $P/policy$p/related_cpus | tr ' ' ,) drv=$(cat $P/policy$p/scaling_driver) "
+    "gov=$(cat $P/policy$p/scaling_governor) max=$(cat $P/policy$p/scaling_max_freq) "
+    "cmax=$(cat $P/policy$p/cpuinfo_max_freq) cur=$(cat $P/policy$p/cpuinfo_cur_freq) "
+    "req=$(cat $P/policy$p/scaling_cur_freq); done; for c in /sys/class/thermal/cooling_device*; do "
+    "echo CF_CDEV $(cat $c/type) $(cat $c/cur_state)/$(cat $c/max_state); done; echo END")
+
+
+def cpufreq_cap_cmd(mode):
+    if mode not in CPUFREQ_CAP_VALUES:
+        sys.exit("tools/dev: cpufreq-cap cap|uncap|status")
+    if (hashlib.sha256(CPUFREQ_CAP_TEMPLATE.encode()).hexdigest() != CPUFREQ_CAP_TEMPLATE_SHA256
+            or CPUFREQ_CAP_TEMPLATE.count("@G@") != 2 or CPUFREQ_CAP_TEMPLATE.count("@P@") != 2):
+        sys.exit("tools/dev: cpufreq-cap command was modified; refusing")
+    g, p = CPUFREQ_CAP_VALUES[mode]
+    return CPUFREQ_CAP_TEMPLATE.replace("@G@", str(g)).replace("@P@", str(p))
+
+
+def parse_cpufreq(out):
+    """{policyN: {k: v}, 'after': {...}, 'result': CF_OK|CF_MISMATCH|CF_PRECHECK_FAIL|None, 'set': {...}}"""
+    r = {"after": None, "result": None, "set": {}, "cdev": []}
+    for line in out.splitlines():
+        w = line.split()
+        if not w:
+            continue
+        kv = dict(t.partition("=")[::2] for t in w[1:] if "=" in t)
+        if w[0].startswith("CF_POLICY"):
+            r["policy" + w[0][9:]] = kv
+        elif w[0] == "CF_AFTER":
+            r["after"] = kv
+        elif w[0] in ("CF_SET4", "CF_SET7"):
+            r["set"][w[0][6:]] = kv.get("rc")
+        elif w[0] in ("CF_OK", "CF_MISMATCH", "CF_PRECHECK_FAIL"):
+            r["result"] = w[0]
+        elif w[0] == "CF_CDEV":
+            r["cdev"].append(" ".join(w[1:]))
+    return r
+
+
+def cpufreq_cap(mode):
+    """status: read-only, 0. cap/uncap: 0 = written and read back; 2 = precheck failed, nothing
+    written; 3 = readback mismatch (stop: no sustained load); 6 = no complete reply."""
+    if mode == "status":
+        out, rc = run(CPUFREQ_STATUS_CMD, 15)
+        sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+        return 0 if rc == 0 else 1
+    cmd = cpufreq_cap_cmd(mode)
+    try:
+        out, rc = _fixed_send(f"cpufreq-cap {mode}", cmd, {SYSFS_WHY}, 20, CPUFREQ_CAP_TARGETS)
+    except (OSError, TimeoutError) as e:
+        print(f"tools/dev: cpufreq-cap {mode}: no complete reply ({e!r}); read `tools/dev cpufreq-cap "
+              f"status` before any load")
+        return 6
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+    r = parse_cpufreq(out)
+    g, p = CPUFREQ_CAP_VALUES[mode]
+    a = r["after"] or {}
+    if r["result"] == "CF_PRECHECK_FAIL" or (rc == 10 and not r["set"]):
+        print(f"cpufreq-cap {mode}: PRECHECK FAILED (related_cpus/driver/cpuinfo_max not as expected); "
+              f"nothing written")
+        return 2
+    if r["result"] == "CF_OK" and rc == 0 and a.get("policy4") == str(g) and a.get("policy7") == str(p):
+        print(f"cpufreq-cap {mode}: policy4 scaling_max_freq {g}, policy7 {p} (read back); "
+              f"policy0 {a.get('policy0')} untouched; cpuinfo_cur 4={a.get('cur4')} 7={a.get('cur7')}")
+        return 0
+    print(f"cpufreq-cap {mode}: READBACK MISMATCH (policy4={a.get('policy4')} policy7={a.get('policy7')}, "
+          f"want {g}/{p}; set rc {r['set']}; device rc={rc}): no sustained load")
+    return 3
+
+
+# -- modules: tarball over serve-usb into /lib/modules (RAM) --
+# mod-fetch REL --sha SHA: fetch modules-REL.tar.gz, verify the sha256 on the device, check every member is
+# under lib/modules/REL/, unpack (the initramfs root is RAM). REL must equal `uname -r`.
+# mod-load / mod-unload LABEL --allow FILE: one insmod / rmmod of a module from the allowlist file, with the
+# parameters written there and nothing else. Format and example: examples/module-allowlist.txt.
+# The sha256 pins the .ko and is checked on the device right before insmod; loaded:/bound: are
+# preconditions checked there too. Modules get parameters only from the insmod line (the kernel cmdline
+# does not reach them). Dependencies are their own labels in load order: there is no modprobe, so nothing
+# autoloads. Free-form insmod/rmmod/modprobe stays refused.
+MOD_TMP = "/tmp/kx"
+REL_RE = re.compile(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9._+-]+)?")
+SHA_RE = re.compile(r"[0-9a-f]{64}")
+MOD_LABEL_RE = re.compile(r"[a-z0-9][a-z0-9_+.-]{0,63}")
+MOD_PATH_RE = re.compile(r"kernel(?:/[A-Za-z0-9_+,.-]+)+\.ko")
+MOD_PARAM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}=[A-Za-z0-9_.,:+-]{0,64}")
+MOD_NEED_RE = re.compile(r"loaded:[A-Za-z0-9_]{1,64}|bound:[A-Za-z0-9@,._-]{1,96}")
+# Never loaded, whatever the allowlist says: PMIC SDAM / secure QFPROM writers, charger and fuel gauge, PMIC
+# PON and reboot-mode, raw bus access, MCU interfaces.
+MOD_DENY = re.compile(r"sdam|sec[-_]?qfprom|charger|smb\d|fuel|battery|bq2\d|max17|reboot[-_]?mode|"
+                      r"(?:^|[-_])pon$|pwrkey|spidev|i2c[-_]dev|syncboss|nrf|(?:^|[-_])blu(?:[-_]|$)|swd|"
+                      r"(?:^|[-_])uio(?:[-_]|$)|kexec")
+MODULE_WHY = next(why for pat, why in RISKY if "module" in why)
+KEXEC_WHY = "kexec"
+
+
+def _mod_name(path):
+    return os.path.basename(path)[:-3].replace("-", "_")
+
+
+def parse_mod_allow(path):
+    """(release, {label: (path, [params], [needs], ko_sha256)}) from a module allowlist file, or SystemExit."""
+    rel, mods = None, {}
+    try:
+        lines = open(path).read().splitlines()
+    except OSError as e:
+        sys.exit(f"tools/dev: module allowlist {path}: {e}")
+    for n, line in enumerate(lines, 1):
+        w = line.split()
+        if not w or w[0].startswith("#"):
+            continue
+        where = f"{path}:{n}"
+        if w[0] == "release":
+            if len(w) != 2 or not REL_RE.fullmatch(w[1]) or rel is not None:
+                sys.exit(f"tools/dev: {where}: need exactly one `release REL` line")
+            rel = w[1]
+            continue
+        label, kpath = w[0], (w[1] if len(w) > 1 else "")
+        shas = [x for x in w[2:] if x.startswith("sha256:")]
+        needs = [x for x in w[2:] if x.startswith(("loaded:", "bound:"))]
+        params = [x for x in w[2:] if not x.startswith(("loaded:", "bound:", "sha256:"))]
+        if len(shas) != 1 or not SHA_RE.fullmatch(shas[0][7:]):
+            sys.exit(f"tools/dev: {where}: needs exactly one sha256:<64 lowercase hex> pin for the .ko")
+        if not MOD_LABEL_RE.fullmatch(label) or label in mods:
+            sys.exit(f"tools/dev: {where}: bad or duplicate label {label!r}")
+        if (not MOD_PATH_RE.fullmatch(kpath) or any(c in (".", "..") for c in kpath.split("/"))):
+            sys.exit(f"tools/dev: {where}: bad module path {kpath!r} (kernel/<dir>/<name>.ko)")
+        if MOD_DENY.search(_mod_name(kpath)) or MOD_DENY.search(os.path.basename(kpath)[:-3]):
+            sys.exit(f"tools/dev: {where}: {os.path.basename(kpath)} is never loaded (MOD_DENY)")
+        if any(not MOD_PARAM_RE.fullmatch(p) for p in params) or len(params) > 8:
+            sys.exit(f"tools/dev: {where}: bad parameter in {params!r} (name=value, [A-Za-z0-9_.,:+-])")
+        if any(not MOD_NEED_RE.fullmatch(x) or ".." in x for x in needs) or len(needs) > 8:
+            sys.exit(f"tools/dev: {where}: bad precondition in {needs!r} (loaded:MODNAME, bound:DEVICE)")
+        mods[label] = (kpath, params, needs, shas[0][7:])
+    if rel is None or not mods:
+        sys.exit(f"tools/dev: module allowlist {path}: needs a `release` line and at least one module")
+    return rel, mods
+
+
+def mod_fetch_steps(rel, sha, port):
+    if not REL_RE.fullmatch(rel or "") or not SHA_RE.fullmatch(sha or ""):
+        sys.exit("tools/dev: mod-fetch needs REL (uname -r form) and --sha (64 lowercase hex)")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1024 <= port <= 65535:
+        sys.exit("tools/dev: --port must be 1024..65535")
+    tgz = f"{MOD_TMP}/modules.tar.gz"
+    url = f"http://{HOST_IP}:{port}/modules-{rel}.tar.gz"
+    return [
+        ("precheck", f"echo rel=$(uname -r); if [ -e /lib/modules/{rel} ]; then echo EXISTS; else echo FREE; fi; "
+                     f"grep MemAvailable /proc/meminfo", 10),
+        ("fetch", f"mkdir -p {MOD_TMP} && rm -f {tgz} && wget -q -T 20 -O {tgz} {url} && ls -l {tgz}", 120),
+        ("verify", f"sha256sum {tgz} | grep -q '^{sha} ' && echo SHA_OK || "
+                   f"{{ sha256sum {tgz}; rm -f {tgz}; echo SHA_BAD; false; }}", 60),
+        ("members", f"n=$(tar -tzf {tgz} | grep -v -c -e '^lib/$' -e '^lib/modules/$' -e '^lib/modules/{rel}/'); "
+                    f"echo OUTSIDE=$n; if [ \"$n\" != 0 ]; then rm -f {tgz}; echo MEMBERS_BAD; false; fi", 60),
+        # Unpacked under /tmp/kx/x and then moved: the recursive-reader rule refuses `tar ... -C /`, and the
+        # member check already confines the tree.
+        ("extract", f"mkdir -p {MOD_TMP}/x /lib/modules && tar -xzf {tgz} -C {MOD_TMP}/x && "
+                    f"mv {MOD_TMP}/x/lib/modules/{rel} /lib/modules/ && rmdir {MOD_TMP}/x/lib/modules "
+                    f"{MOD_TMP}/x/lib {MOD_TMP}/x && rm -f {tgz} && du -sh /lib/modules/{rel} && "
+                    f"ls /lib/modules/{rel}/modules.dep", 120),
+    ]
+
+
+def mod_fetch(rel, sha, port):
+    steps = mod_fetch_steps(rel, sha, port)
+    out, _ = run(steps[0][1], steps[0][2])
+    print("[precheck]\n  " + out.rstrip().replace("\n", "\n  "))
+    got = next((l[4:].strip() for l in out.splitlines() if l.startswith("rel=")), None)
+    if got != rel:
+        sys.exit(f"tools/dev: running kernel {got!r} is not {rel}: its modules would be refused "
+                 f"(vermagic); nothing fetched")
+    if "EXISTS" in out.split():
+        sys.exit(f"tools/dev: /lib/modules/{rel} already exists on the target; nothing fetched")
+    run_steps(steps[1:], stop_on=("SHA_BAD", "MEMBERS_BAD"))
+
+
+def mod_load_cmd(rel, kpath, params, needs, ko_sha):
+    """Three lines in one subshell (each < LINE_MAX): release, file and .ko sha256 checks; the file's
+    preconditions and the already-loaded check; the insmod with the listed parameters."""
+    name = _mod_name(kpath)
+    if not SHA_RE.fullmatch(ko_sha or ""):
+        sys.exit("tools/dev: mod-load needs the .ko sha256 pin")
+    pre = ""
+    for x in needs:
+        kind, _, what = x.partition(":")
+        if kind == "loaded":
+            pre += f"grep -q '^{what} ' /proc/modules || {{ echo MOD_NEED_MISSING {x}; exit 13; }}; "
+        else:
+            pre += (f"[ -e /sys/bus/platform/devices/{what}/driver ] || "
+                    f"{{ echo MOD_NEED_MISSING {x}; exit 13; }}; ")
+    return (f"( f=/lib/modules/{rel}/{kpath}; [ \"$(uname -r)\" = {rel} ] || {{ echo MOD_REL_BAD $(uname -r); exit 10; }}; "
+            f"[ -f $f ] || {{ echo MOD_NO_KO $f; exit 11; }}; "
+            f"sha256sum $f | grep -q '^{ko_sha} ' || {{ echo MOD_SHA_BAD $f; exit 14; }}\n"
+            f"{pre}if grep -q '^{name} ' /proc/modules; then echo MOD_ALREADY {name}; exit 12; fi\n"
+            f"insmod $f{''.join(' ' + p for p in params)}; r=$?; echo MOD_INSMOD {name} rc=$r; "
+            f"grep '^{name} ' /proc/modules; dmesg | tail -n 30; exit $r )")
+
+
+def mod_unload_cmd(kpath):
+    name = _mod_name(kpath)
+    return (f"( if ! grep -q '^{name} ' /proc/modules; then echo MOD_NOT_LOADED {name}; exit 10; fi; "
+            f"rmmod {name}; r=$?; echo MOD_RMMOD {name} rc=$r; grep '^{name} ' /proc/modules; "
+            f"dmesg | tail -n 10; exit $r )")
+
+
+def mod_op(op, label, allow):
+    rel, mods = parse_mod_allow(allow)
+    if label not in mods:
+        sys.exit(f"tools/dev: {label!r} is not in the module allowlist {allow} ({', '.join(mods)})")
+    kpath, params, needs, ko_sha = mods[label]
+    cmd = mod_load_cmd(rel, kpath, params, needs, ko_sha) if op == "load" else mod_unload_cmd(kpath)
+    try:
+        out, rc = _fixed_send(f"mod-{op} {label}", cmd, {MODULE_WHY}, 90)
+    except (OSError, TimeoutError) as e:
+        print(f"tools/dev: mod-{op} {label}: no complete reply ({e!r}); check `cat /proc/modules` and dmesg")
+        return 6
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+    return rc
+
+
+# -- kexec-self: same-DT kexec_file_load of a pinned Image + initramfs --
+# fetch: Image and initramfs from the payload dir served by serve-usb.py into /tmp/kx, sha-checked.
+# load: re-check both shas, then `kexec -s -l`; the running FDT is reused, no new DTB is possible.
+# exec: refused unless an image is loaded, the 17c10000.watchdog qcom_wdt node exists, no NFS or /stage2
+#   mount, no `yes` load, no armed init reset, and the hottest thermal zone reads < 65 C. Then, detached
+#   so the reply comes back first: open the watchdog on fd 3 (qcom_wdt starts a 30 s bite nobody pets),
+#   sleep 2, exec kexec -e. Any failure after that ends in the bite; if the open fails, sh exits and
+#   kexec -e never runs.
+# unload: kexec -u. status: read-only. Free-form `kexec` and /dev/watchdog stay refused.
+KX_TMP = "/tmp/kx"
+KX_CMDLINE_RE = re.compile(r"[A-Za-z0-9_.,=/:+-]+(?: [A-Za-z0-9_.,=/:+-]+)*")
+KX_TMAX = 65000
+KX_STATUS_CMD = ("echo KX_STATUS rel=$(uname -r) loaded=$(cat /sys/kernel/kexec_loaded) "
+                 "disabled=$(cat /proc/sys/kernel/kexec_load_disabled) "
+                 "nfs=$(grep -c ' nfs' /proc/mounts) s2=$(grep -c ' /stage2' /proc/mounts); "
+                 "ls -l /sys/firmware/fdt /sbin/kexec /tmp/kx 2>&1; grep MemAvailable /proc/meminfo; "
+                 "cat /proc/cmdline; echo END")
+KX_LOAD_TEMPLATE = (
+    "( [ \"$(cat /sys/kernel/kexec_loaded)\" = 0 ] || { echo KX_ALREADY_LOADED; exit 10; }; "
+    "sha256sum /tmp/kx/Image | grep -q '^@ISHA@ ' && sha256sum /tmp/kx/initrd | grep -q '^@RSHA@ ' || "
+    "{ echo KX_SHA_BAD; exit 11; }; "
+    "/sbin/kexec -s -l /tmp/kx/Image --initrd=/tmp/kx/initrd --command-line=\"@CMDLINE@\"; r=$?; "
+    "echo KX_LOAD rc=$r loaded=$(cat /sys/kernel/kexec_loaded); exit $r )")
+KX_EXEC_CMD = (
+    "( d=; for w in /sys/class/watchdog/watchdog*; do n=$(readlink -f $w/device); "
+    "if [ \"${n##*/}\" = 17c10000.watchdog ]; then d=/dev/${w##*/}; fi; done\n"
+    "if [ \"$(cat /sys/kernel/kexec_loaded)\" != 1 ]; then echo KX_REFUSED not-loaded; exit 10; fi; "
+    "if [ ! -c \"$d\" ]; then echo KX_REFUSED no-wdt; exit 11; fi; "
+    "if grep -q -e ' nfs' -e ' /stage2' /proc/mounts; then echo KX_REFUSED mounts; exit 12; fi; "
+    "if [ -n \"$(pidof yes)\" ]; then echo KX_REFUSED load; exit 13; fi; "
+    "if [ -e /tmp/lvr-reset ]; then echo KX_REFUSED reset-armed; exit 14; fi\n"
+    "T=0; for z in /sys/class/thermal/thermal_zone*/temp; do v=$(cat $z 2>/dev/null); "
+    "case \"$v\" in ''|*[!0-9]*) ;; *) if [ \"$v\" -gt \"$T\" ]; then T=$v; fi;; esac; done; "
+    "if [ \"$T\" = 0 ] || [ \"$T\" -ge 65000 ]; then echo KX_REFUSED tmax=$T; exit 15; fi\n"
+    "setsid sh -c \"exec 3>$d || exit 1; sleep 2; exec /sbin/kexec -e\" </dev/null >/tmp/kx/exec.log 2>&1 & "
+    "echo KX_ARMED wdt=$d tmax=$T )")
+KX_UNLOAD_CMD = "( /sbin/kexec -u; r=$?; echo KX_UNLOAD rc=$r loaded=$(cat /sys/kernel/kexec_loaded); exit $r )"
+KX_SHA256 = {"load": "59ad0a19c6bac3723409a78472f693bde87c583769bc4a504a20e9be42689a65", "exec": "4cbea9d6dac6eba2fc8a3c926051c5109853342329afab36559c72ede94fb925", "unload": "27ab196af4eaf8da6c525f05c9894c8ed70fddf73663a00f7e3b98065b45d6e0"}
+HWTOOL_WHY = "hardware-state write tool"          # the DENY text for \bwatchdog\b (sysfs class name)
+DBG_GLOB_WHY = "glob in a command that names or enters debugfs (spell the path out)"  # /sys/kernel + globs
+# exec names /sys/kernel/kexec_loaded, globs the watchdog and thermal zones, reads the init reset flag and
+# runs sh and kexec; hence these refusals.
+KX_EXEC_WHYS = {KEXEC_WHY, HWTOOL_WHY, LVR_WHY, SYSFS_WRITER_WHY, GLOB_WRITE_WHY, DBG_GLOB_WHY}
+
+
+# The second kernel's cmdline is an exact token allowlist (identity_dma, qcom_scm.* and anything else are
+# refused): exactly one panic= (0 or 10), each token at most once, rdinit=/init first, lvr_kexec=1 required.
+KX_CMDLINE_TOKENS = frozenset((
+    "rdinit=/init", "clk_ignore_unused", "pd_ignore_unused", "regulator_ignore_unused", "printk.devkmsg=on",
+    "panic=0", "panic=10", "log_buf_len=4M", "msm.separate_gpu_kms=1", "lvr_kexec=1",
+    "watchdog.open_timeout=90", "initcall_debug", "ignore_loglevel",
+    "driver_async_probe=qcom_scm"))
+# `driver_async_probe=qcom_scm` (exactly this value) moves the SCM probe to an async worker, so a hung boot
+# SMC ends in the stall detector / hung-task panic instead of a cold reset; other values are refused.
+# `reboot=warm` is refused like every reboot= value: a warm reboot(2) hangs in TrustZone.
+# watchdog.open_timeout=90 is the one token the denylist's \bwatchdog\b rule (HWTOOL_WHY) matches in
+# `kexec-self load`; it is a parameter for the second kernel, not a device command, and the load self-check
+# tolerates HWTOOL_WHY only when that exact token alone causes it.
+KX_WDT_TOKEN = "watchdog.open_timeout=90"
+# quest2_warm_reset parameters, so a panic in the second kernel also ends in the warm reset: exactly
+# on_panic=1 and boot_stall_secs=<20..75> (decimal, no sign or leading zero, at most once), nothing else.
+KX_WARM_ON_PANIC = "quest2_warm_reset.on_panic=1"
+KX_WARM_STALL_RE = re.compile(r"quest2_warm_reset\.boot_stall_secs=([1-9][0-9]{1,2})")
+KX_WARM_STALL_MIN, KX_WARM_STALL_MAX = 20, 75
+
+
+def kx_warm_token_ok(tok):
+    """True only for KX_WARM_ON_PANIC or quest2_warm_reset.boot_stall_secs=N with 20 <= N <= 75."""
+    if tok == KX_WARM_ON_PANIC:
+        return True
+    m = KX_WARM_STALL_RE.fullmatch(tok)
+    return bool(m) and KX_WARM_STALL_MIN <= int(m.group(1)) <= KX_WARM_STALL_MAX
+
+
+def kx_check_cmdline(cmdline):
+    """Refuse anything but a plain token list from KX_CMDLINE_TOKENS (plus the two quest2_warm_reset
+    tokens, kx_warm_token_ok) that starts with rdinit=/init, carries exactly one panic= (0 or 10) and the
+    lvr_kexec=1 marker; no duplicates (one boot_stall_secs), quotes, $, backquotes or
+    other init= tokens."""
+    if not isinstance(cmdline, str) or not KX_CMDLINE_RE.fullmatch(cmdline) or len(cmdline) > 512:
+        sys.exit("tools/dev: kexec-self --cmdline: plain tokens [A-Za-z0-9_.,=/:+-] separated by single "
+                 "spaces, <= 512 bytes")
+    toks = cmdline.split(" ")
+    inits = [t for t in toks if t.split("=", 1)[0] in ("init", "rdinit")]
+    if toks[0] != "rdinit=/init" or inits != ["rdinit=/init"] or "lvr_kexec=1" not in toks \
+            or sum(t.split("=", 1)[0] == "panic" for t in toks) != 1 \
+            or not ("panic=0" in toks or "panic=10" in toks):
+        sys.exit("tools/dev: kexec-self --cmdline must start with rdinit=/init (no other init=), and "
+                 "contain exactly one of panic=0 / panic=10, and lvr_kexec=1")
+    bad = [t for t in toks if t not in KX_CMDLINE_TOKENS and not kx_warm_token_ok(t)]
+    keys = [t.split("=", 1)[0] for t in toks if t.startswith("quest2_warm_reset.")]
+    if bad or len(set(toks)) != len(toks) or len(set(keys)) != len(keys):
+        sys.exit(f"tools/dev: kexec-self --cmdline: token(s) not allowed or repeated "
+                 f"({' '.join(bad) or 'duplicate'}); allowed, once each: {' '.join(sorted(KX_CMDLINE_TOKENS))} "
+                 f"{KX_WARM_ON_PANIC} quest2_warm_reset.boot_stall_secs=<{KX_WARM_STALL_MIN}..{KX_WARM_STALL_MAX}>")
+    return cmdline
+
+
+def kx_fetch_cmd(isha, rsha, port):
+    if not SHA_RE.fullmatch(isha or "") or not SHA_RE.fullmatch(rsha or ""):
+        sys.exit("tools/dev: kexec-self needs --image-sha and --initrd-sha (64 lowercase hex)")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1024 <= port <= 65535:
+        sys.exit("tools/dev: --port must be 1024..65535")
+    u = f"http://{HOST_IP}:{port}"
+    return (f"mkdir -p {KX_TMP} && rm -f {KX_TMP}/Image {KX_TMP}/initrd && "
+            f"wget -q -T 30 -O {KX_TMP}/Image {u}/Image && wget -q -T 20 -O {KX_TMP}/initrd {u}/initramfs && "
+            f"{{ sha256sum {KX_TMP}/Image | grep -q '^{isha} ' && sha256sum {KX_TMP}/initrd | grep -q '^{rsha} ' "
+            f"&& echo KX_SHA_OK || {{ sha256sum {KX_TMP}/Image {KX_TMP}/initrd; rm -f {KX_TMP}/Image "
+            f"{KX_TMP}/initrd; echo KX_SHA_BAD; false; }}; }}")
+
+
+def _kx_pinned(which, text):
+    if hashlib.sha256(text.encode()).hexdigest() != KX_SHA256[which]:
+        sys.exit(f"tools/dev: kexec-self {which} command was modified; refusing")
+    return text
+
+
+def kx_load_cmd(isha, rsha, cmdline):
+    if not SHA_RE.fullmatch(isha or "") or not SHA_RE.fullmatch(rsha or ""):
+        sys.exit("tools/dev: kexec-self needs --image-sha and --initrd-sha (64 lowercase hex)")
+    t = _kx_pinned("load", KX_LOAD_TEMPLATE)
+    return t.replace("@ISHA@", isha).replace("@RSHA@", rsha).replace("@CMDLINE@", kx_check_cmdline(cmdline))
+
+
+def kx_load_whys(isha, rsha, cmdline):
+    """The refusal set `kexec-self load`'s self-check expects: {KEXEC_WHY}, plus HWTOOL_WHY if the
+    cmdline carries KX_WDT_TOKEN, only if it is attributable to that exact token: the load command
+    without it is refused by the kexec rule alone, and with it added back it gains exactly that
+    token's refusal."""
+    toks = kx_check_cmdline(cmdline).split(" ")
+    exc = {KX_WDT_TOKEN: HWTOOL_WHY}
+    present = [k for k in exc if k in toks]
+    if not present:
+        return {KEXEC_WHY}
+
+    def without(drop):
+        return refusals(kx_load_cmd(isha, rsha, " ".join(t for t in toks if t not in drop)))
+    got = without(present)
+    if got != [KEXEC_WHY]:
+        sys.exit(f"tools/dev: kexec-self load self-check failed (the cmdline without {' '.join(present)} "
+                 f"is refused by {got}); refusing")
+    for k in present:
+        got = without([x for x in present if x != k])
+        if set(got) != {KEXEC_WHY, exc[k]} or len(got) != 2:
+            sys.exit(f"tools/dev: kexec-self load self-check failed ({k} adds {got}); refusing")
+    return {KEXEC_WHY} | {exc[k] for k in present}
+
+
+def kexec_self(action, isha=None, rsha=None, cmdline=None, port=8000):
+    """status/fetch: 0 ok. load: 0 = loaded. exec: 0 = armed (the jump follows ~2 s later).
+    unload: 0. 2 = refused on the device (nothing done); 6 = no complete reply."""
+    if action == "status":
+        out, rc = _fixed_send("kexec-self status", KX_STATUS_CMD, {KEXEC_WHY}, 15)
+        sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+        return 0 if rc == 0 else 1
+    if action == "fetch":
+        out, rc = run(kx_fetch_cmd(isha, rsha, port), 180)
+        sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+        return 0 if rc == 0 and "KX_SHA_OK" in out.split() else 2
+    if action == "load":
+        cmd, whys, label = kx_load_cmd(isha, rsha, cmdline), kx_load_whys(isha, rsha, cmdline), "load"
+    elif action == "exec":
+        cmd, whys, label = _kx_pinned("exec", KX_EXEC_CMD), KX_EXEC_WHYS, "exec"
+    elif action == "unload":
+        cmd, whys, label = _kx_pinned("unload", KX_UNLOAD_CMD), {KEXEC_WHY}, "unload"
+    else:
+        sys.exit("tools/dev: kexec-self status|fetch|load|exec|unload")
+    try:
+        out, rc = _fixed_send(f"kexec-self {label}", cmd, whys, 60 if action == "load" else 20,
+                              ["/tmp/kx/exec.log"] if action == "exec" else [])
+    except (OSError, TimeoutError) as e:
+        print(f"tools/dev: kexec-self {action}: no complete reply ({e!r})"
+              + ("; if KX_ARMED was sent the jump (or the watchdog bite within 30 s) follows: "
+                 "watch lsusb for 1d6b:0105, no device commands" if action == "exec" else ""))
+        return 6
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+    w = out.split()
+    if action == "exec":
+        if rc == 0 and "KX_ARMED" in w:
+            print("kexec-self exec: watchdog armed (30 s bite) and kexec -e in ~2 s. Host only from now: "
+                  "1d6b:0105 drops, then returns with the same MAC within ~5-10 s; then `tools/dev status`, "
+                  "`cat /proc/cmdline` (lvr_kexec=1), heartbeat loop. No link 60 s after this: expect the "
+                  "bite and Android (2833:5013) ~45 s after arming; nothing after 3 min: long-press.")
+            return 0
+        print(f"kexec-self exec: refused on the device ({' '.join(x for x in w if x.startswith(('KX_', 'tmax')))}); "
+              f"nothing armed")
+        return 2
+    if rc == 0:
+        return 0
+    return 2 if any(x in w for x in ("KX_ALREADY_LOADED", "KX_SHA_BAD")) else rc
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="tools/dev", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="op", required=True, metavar="COMMAND")
+    ck = sub.add_parser("check"); ck.add_argument("cmd", nargs="?")
+    ck.add_argument("-f", dest="file", help="check every non-empty, non-# line of FILE")
+    ck.add_argument("--allow-modules", action="store_true")
+    sub.add_parser("status")
+    b = sub.add_parser("battery"); b.add_argument("--csv", action="store_true")
+    sh = sub.add_parser("sh"); sh.add_argument("cmd"); sh.add_argument("-t", type=float, default=30)
+    sh.add_argument("--allow-modules", action="store_true")
+    p = sub.add_parser("pull"); p.add_argument("remote"); p.add_argument("local")
+    lg = sub.add_parser("log"); lg.add_argument("n", nargs="?", type=int, default=50)
+    ra = sub.add_parser("return-android")
+    ra.add_argument("--kexec-dir", help=f"quest-kexec checkout (default: ${KEXEC_DIR_ENV}); only for the downstream boot")
+    u = sub.add_parser("s2-up"); u.add_argument("name", nargs="?", default="stage2-latest.tar.gz")
+    u.add_argument("--port", type=int, default=8000)
+    u.add_argument("--sha", help="refuse unless the tarball's .sha256 equals this value")
+    s2 = sub.add_parser("s2"); s2.add_argument("cmd"); s2.add_argument("-t", type=float, default=30)
+    sub.add_parser("s2-down")
+    sub.add_parser("syncboss-txlen")
+    fb = sub.add_parser("fw-fallback"); fb.add_argument("mode", choices=["on", "off", "status"])
+    ft = sub.add_parser("fan-test"); ft.add_argument("seconds", type=int)
+    ls = sub.add_parser("load-step"); ls.add_argument("--cores", type=int, required=True)
+    ls.add_argument("--seconds", type=int, required=True)
+    ls.add_argument("--fan255", type=int, help="max rpm at pwm 255 from `tools/dev fan-test`")
+    ls.add_argument("--log", help="append every sample line to this file (default: LOG_DIR/load-step.log)")
+    dr = sub.add_parser("drain")
+    dr.add_argument("--log", help="drain log file (default: LOG_DIR/drain.log); holds the 60 s spacing")
+    cf = sub.add_parser("cpufreq-cap"); cf.add_argument("mode", choices=["cap", "uncap", "status"])
+    mf = sub.add_parser("mod-fetch"); mf.add_argument("release")
+    mf.add_argument("--sha", required=True, help="expected sha256 of modules-RELEASE.tar.gz")
+    mf.add_argument("--port", type=int, default=8000)
+    for op in ("mod-load", "mod-unload"):
+        m = sub.add_parser(op); m.add_argument("label")
+        m.add_argument("--allow", required=True, help="module allowlist file (see examples/module-allowlist.txt)")
+    kx = sub.add_parser("kexec-self"); kx.add_argument("action", choices=["status", "fetch", "load", "exec", "unload"])
+    kx.add_argument("--image-sha"); kx.add_argument("--initrd-sha"); kx.add_argument("--cmdline")
+    kx.add_argument("--port", type=int, default=8000)
+    hb = sub.add_parser("heartbeat"); hb.add_argument("--loop", type=float, metavar="SECS")
+    hb.add_argument("--max-duration", type=float, default=HB_MAX_DURATION_DEFAULT, metavar="SECS")
+    a = ap.parse_args()
+
+    if a.op == "check":
+        if a.file:
+            cmds = [l.strip() for l in open(a.file) if l.strip() and not l.lstrip().startswith("#")]
+        elif a.cmd:
+            cmds = [a.cmd]
+        else:
+            sys.exit("check: give CMD or -f FILE")
+        bad = 0
+        for c in cmds:
+            why = refusal(c, a.allow_modules) or transport_refusal(c)
+            bad += bool(why)
+            print(f"{'refused: ' + why if why else 'allowed'}{'  | ' + c if len(cmds) > 1 else ''}")
+        sys.exit(1 if bad else 0)
+    elif a.op == "status":
+        sys.exit(status())
+    elif a.op == "battery":
+        try:
+            print(battery(a.csv))
+        except (OSError, TimeoutError, ValueError) as e:
+            print(no_shell("battery", e), file=sys.stderr)
+            sys.exit(2)
+    elif a.op == "sh":
+        out, rc = run(a.cmd, a.t, a.allow_modules)
+        sys.stdout.write(out)
+        sys.exit(rc)
+    elif a.op == "pull":
+        check(f"cat {a.remote}")
+        out, rc = run(f"base64 {a.remote}", 120)
+        if rc:
+            sys.exit(f"pull failed (rc={rc}): {out.strip()[:200]}")
+        with open(a.local, "wb") as f:
+            f.write(base64.b64decode("".join(out.split())))
+        print(f"{a.remote} -> {a.local} ({os.path.getsize(a.local)} bytes)")
+    elif a.op == "log":
+        out, _ = run(f"tail -n {int(a.n)} /tmp/kernel.log", 15)
+        sys.stdout.write(out)
+    elif a.op == "return-android":
+        sys.exit(return_android(a.kexec_dir))
+    elif a.op == "s2-up":
+        s2_up(a.name, a.port, a.sha)
+    elif a.op == "s2":
+        check(a.cmd)  # the inner command alone, before quoting
+        out, rc = run(s2_wrap(a.cmd), a.t)
+        sys.stdout.write(out)
+        sys.exit(rc)
+    elif a.op == "s2-down":
+        s2_down()
+    elif a.op == "syncboss-txlen":
+        syncboss_txlen()
+    elif a.op == "fw-fallback":
+        fw_fallback(a.mode)
+    elif a.op == "fan-test":
+        sys.exit(fan_test(a.seconds))
+    elif a.op == "load-step":
+        sys.exit(load_step(a.cores, a.seconds, a.fan255, _log_path(a.log, "load-step.log")))
+    elif a.op == "drain":
+        sys.exit(drain(a.log))
+    elif a.op == "heartbeat":
+        heartbeat(a.loop, a.max_duration)
+    elif a.op == "cpufreq-cap":
+        sys.exit(cpufreq_cap(a.mode))
+    elif a.op == "mod-fetch":
+        mod_fetch(a.release, a.sha, a.port)
+    elif a.op in ("mod-load", "mod-unload"):
+        sys.exit(mod_op(a.op[4:], a.label, a.allow))
+    elif a.op == "kexec-self":
+        sys.exit(kexec_self(a.action, a.image_sha, a.initrd_sha, a.cmdline, a.port))
+
+
+if __name__ == "__main__":
+    main()

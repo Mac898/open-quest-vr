@@ -1,0 +1,1023 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 14/16] misc: Add Oculus Quest 2 warm reset driver
+
+Add a DRAM-preserving warm reset back to Android for the Oculus Quest
+2: re-arm the APSS watchdog as a backstop, set the PM8150 PON PS_HOLD
+reset type to WARM over SPMI and drop PS_HOLD, as the vendor kernel
+does. PSCI SYSTEM_RESET2 with a warm reset type hangs in the secure
+firmware on this device, so no PSCI or SCM call is made.
+
+The reset is triggered by writing "r" to /proc/lvr_warm_reset, and with
+quest2_warm_reset.on_panic=1 also when panic() restarts, after kmsg_dump
+and the panic=N delay, so ramoops keeps the panic log.
+
+quest2_warm_reset.boot_stall_secs=N adds a detector that dumps state
+and panics if init has not started N seconds after boot. Its log scan
+has KUnit tests.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ drivers/misc/Kconfig                   |  24 +
+ drivers/misc/Makefile                  |   2 +
+ drivers/misc/quest2-warm-reset-stall.h | 125 +++++
+ drivers/misc/quest2-warm-reset-test.c  | 192 ++++++++
+ drivers/misc/quest2-warm-reset.c       | 612 +++++++++++++++++++++++++
+ 5 files changed, 955 insertions(+)
+ create mode 100644 drivers/misc/quest2-warm-reset-stall.h
+ create mode 100644 drivers/misc/quest2-warm-reset-test.c
+ create mode 100644 drivers/misc/quest2-warm-reset.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 0613092b6..956e2b768 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -663,6 +663,30 @@ config QUEST2_SYNCBOSS_KUNIT_TEST
+ 	  Tests the frame builder, checksum, RX frame checks, packet parser
+ 	  and command allowlist of the Quest 2 syncboss driver.
+ 
++config QUEST2_WARM_RESET
++	bool "Oculus Quest 2 warm reset back to Android (PON WARM + PS_HOLD)"
++	depends on ARM64 && OF && PROC_FS && SPMI && MFD_SPMI_PMIC
++	help
++	  DRAM-preserving warm reset of the Oculus Quest 2 ("hollywood")
++	  through the PM8150 PS_HOLD reset type, without PSCI, SCM or
++	  device_shutdown(). Triggered by writing "r" to /proc/lvr_warm_reset,
++	  and optionally when panic() restarts (quest2_warm_reset.on_panic=1).
++
++	  Also an optional boot-stall detector
++	  (quest2_warm_reset.boot_stall_secs=N) that dumps state and panics if
++	  init has not started N seconds after boot.
++
++config QUEST2_WARM_RESET_KUNIT_TEST
++	tristate "KUnit tests for the Quest 2 boot-stall log scan" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  Tests the kernel-log scan of the Quest 2 boot-stall detector
++	  (unreturned initcalls, last log lines). Pure string handling; no
++	  hardware access.
++
++	  If unsure, say N.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index d0d9d984f..f3da14455 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -77,3 +77,5 @@ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_QUEST2_SYNCBOSS)	+= quest2-syncboss.o
+ obj-$(CONFIG_QUEST2_SYNCBOSS_KUNIT_TEST)	+= quest2-syncboss-test.o
++obj-$(CONFIG_QUEST2_WARM_RESET)	+= quest2-warm-reset.o
++obj-$(CONFIG_QUEST2_WARM_RESET_KUNIT_TEST)	+= quest2-warm-reset-test.o
+diff --git a/drivers/misc/quest2-warm-reset-stall.h b/drivers/misc/quest2-warm-reset-stall.h
+new file mode 100644
+index 000000000..03d839841
+--- /dev/null
++++ b/drivers/misc/quest2-warm-reset-stall.h
+@@ -0,0 +1,125 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Quest 2 boot-stall detector: kernel-log scan helpers, shared with the KUnit
++ * test.
++ *
++ * Given the log one line at a time, keep the initcalls that printed "calling
++ * <fn> @ <pid>" (initcall_debug) without a matching "initcall <fn> returned",
++ * and the last Q2WR_TAIL_MAX lines, so that the stall report can print them
++ * again at the end of the log, which is the part ramoops keeps.
++ */
++#ifndef _QUEST2_WARM_RESET_STALL_H
++#define _QUEST2_WARM_RESET_STALL_H
++
++#include <linux/string.h>
++#include <linux/types.h>
++
++#define Q2WR_IC_MAX	8	/* pending initcalls kept (newest) */
++#define Q2WR_TAIL_MAX	16	/* last log lines kept */
++#define Q2WR_SYM_LEN	96
++#define Q2WR_LINE_LEN	192
++
++struct q2wr_ic_entry {
++	char sym[Q2WR_SYM_LEN];
++	char line[Q2WR_LINE_LEN];
++};
++
++struct q2wr_scan {
++	struct q2wr_ic_entry ic[Q2WR_IC_MAX];	/* oldest first */
++	unsigned int n_ic;
++	unsigned int ic_dropped;		/* pending entries pushed out */
++	char tail[Q2WR_TAIL_MAX][Q2WR_LINE_LEN];
++	unsigned int tail_next;
++	unsigned int tail_n;
++};
++
++static inline void q2wr_scan_init(struct q2wr_scan *s)
++{
++	memset(s, 0, sizeof(*s));
++}
++
++/* Copy at most @len bytes of @src (not NUL-terminated), minus trailing newlines. */
++static inline void q2wr_copy_line(char *dst, size_t size, const char *src, size_t len)
++{
++	while (len && (src[len - 1] == '\n' || src[len - 1] == '\0'))
++		len--;
++	if (len >= size)
++		len = size - 1;
++	memcpy(dst, src, len);
++	dst[len] = '\0';
++}
++
++/*
++ * Copy the text between the first @start and the following @end into @sym
++ * (truncated to @size - 1). False if either marker is missing or the text
++ * is empty.
++ */
++static inline bool q2wr_extract(const char *line, const char *start,
++				const char *end, char *sym, size_t size)
++{
++	const char *s = strstr(line, start);
++	const char *e;
++	size_t n;
++
++	if (!s)
++		return false;
++	s += strlen(start);
++	e = strstr(s, end);
++	if (!e || e == s)
++		return false;
++	n = e - s;
++	if (n >= size)
++		n = size - 1;
++	memcpy(sym, s, n);
++	sym[n] = '\0';
++	return true;
++}
++
++static inline void q2wr_scan_line(struct q2wr_scan *s, const char *buf, size_t len)
++{
++	char line[Q2WR_LINE_LEN];
++	char sym[Q2WR_SYM_LEN];
++	unsigned int i;
++
++	q2wr_copy_line(line, sizeof(line), buf, len);
++
++	strscpy(s->tail[s->tail_next], line, Q2WR_LINE_LEN);
++	s->tail_next = (s->tail_next + 1) % Q2WR_TAIL_MAX;
++	if (s->tail_n < Q2WR_TAIL_MAX)
++		s->tail_n++;
++
++	if (q2wr_extract(line, "calling  ", " @ ", sym, sizeof(sym))) {
++		if (s->n_ic == Q2WR_IC_MAX) {
++			memmove(&s->ic[0], &s->ic[1],
++				(Q2WR_IC_MAX - 1) * sizeof(s->ic[0]));
++			s->n_ic--;
++			s->ic_dropped++;
++		}
++		strscpy(s->ic[s->n_ic].sym, sym, Q2WR_SYM_LEN);
++		strscpy(s->ic[s->n_ic].line, line, Q2WR_LINE_LEN);
++		s->n_ic++;
++		return;
++	}
++
++	if (q2wr_extract(line, "initcall ", " returned ", sym, sizeof(sym))) {
++		/* Newest match first: the same initcall cannot nest. */
++		for (i = s->n_ic; i-- > 0;) {
++			if (strcmp(s->ic[i].sym, sym))
++				continue;
++			memmove(&s->ic[i], &s->ic[i + 1],
++				(s->n_ic - i - 1) * sizeof(s->ic[0]));
++			s->n_ic--;
++			break;
++		}
++	}
++}
++
++/* The i-th kept log line, oldest first (0 <= i < s->tail_n). */
++static inline const char *q2wr_tail_line(const struct q2wr_scan *s, unsigned int i)
++{
++	unsigned int first = (s->tail_next + Q2WR_TAIL_MAX - s->tail_n) % Q2WR_TAIL_MAX;
++
++	return s->tail[(first + i) % Q2WR_TAIL_MAX];
++}
++
++#endif /* _QUEST2_WARM_RESET_STALL_H */
+diff --git a/drivers/misc/quest2-warm-reset-test.c b/drivers/misc/quest2-warm-reset-test.c
+new file mode 100644
+index 000000000..3660c5a73
+--- /dev/null
++++ b/drivers/misc/quest2-warm-reset-test.c
+@@ -0,0 +1,192 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * KUnit tests for the Quest 2 boot-stall detector's kernel-log scan
++ * (quest2-warm-reset-stall.h). Line formats from init/main.c
++ * trace_initcall_start_cb()/trace_initcall_finish_cb() and kernel/async.c.
++ */
++#include <kunit/test.h>
++#include <linux/string.h>
++
++#include "quest2-warm-reset-stall.h"
++
++static struct q2wr_scan *q2wr_test_scan(struct kunit *test)
++{
++	struct q2wr_scan *s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	q2wr_scan_init(s);
++	return s;
++}
++
++static void feed(struct q2wr_scan *s, const char *line)
++{
++	q2wr_scan_line(s, line, strlen(line));
++}
++
++static void q2wr_test_pair(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++
++	feed(s, "[    0.078029] calling  sp805_wdt_driver_init+0x0/0x20 @ 1\n");
++	KUNIT_EXPECT_EQ(test, s->n_ic, 1U);
++	KUNIT_EXPECT_STREQ(test, s->ic[0].sym, "sp805_wdt_driver_init+0x0/0x20");
++	feed(s, "[    0.078041] initcall sp805_wdt_driver_init+0x0/0x20 returned 0 after 5 usecs");
++	KUNIT_EXPECT_EQ(test, s->n_ic, 0U);
++	KUNIT_EXPECT_EQ(test, s->ic_dropped, 0U);
++}
++
++static void q2wr_test_pending(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++
++	feed(s, "[    1.000000] calling  a_init+0x0/0x10 @ 1\n");
++	feed(s, "[    1.000001] calling  b_init+0x0/0x10 @ 1\n");
++	feed(s, "[    1.000002] probe of c264000.warm-reset returned 0 after 9 usecs\n");
++	feed(s, "[    1.000003] initcall b_init+0x0/0x10 returned -19 after 1 usecs\n");
++	KUNIT_ASSERT_EQ(test, s->n_ic, 1U);
++	KUNIT_EXPECT_STREQ(test, s->ic[0].sym, "a_init+0x0/0x10");
++	/* The kept line is the log line without the newline. */
++	KUNIT_EXPECT_STREQ(test, s->ic[0].line, "[    1.000000] calling  a_init+0x0/0x10 @ 1");
++}
++
++static void q2wr_test_async(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++
++	feed(s, "[    2.0] calling  12_async_probe+0x0/0x40 @ 87\n");
++	feed(s, "[    2.1] calling  13_async_probe+0x0/0x40 @ 88\n");
++	feed(s, "[    2.2] initcall 12_async_probe+0x0/0x40 returned after 4 usecs\n");
++	KUNIT_ASSERT_EQ(test, s->n_ic, 1U);
++	KUNIT_EXPECT_STREQ(test, s->ic[0].sym, "13_async_probe+0x0/0x40");
++}
++
++static void q2wr_test_unmatched_return(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++
++	feed(s, "calling  x+0x0/0x4 @ 1");
++	feed(s, "initcall y+0x0/0x4 returned 0 after 1 usecs");
++	feed(s, "initcall x+0x0/0x4");	/* no " returned " */
++	KUNIT_ASSERT_EQ(test, s->n_ic, 1U);
++	KUNIT_EXPECT_STREQ(test, s->ic[0].sym, "x+0x0/0x4");
++}
++
++static void q2wr_test_not_initcall(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++
++	feed(s, "calling  @ 1");		/* empty symbol */
++	feed(s, "calling  foo without pid");	/* no " @ " */
++	feed(s, "something calling me");
++	feed(s, "");
++	KUNIT_EXPECT_EQ(test, s->n_ic, 0U);
++	KUNIT_EXPECT_EQ(test, s->tail_n, 4U);
++}
++
++static void q2wr_test_overflow(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++	char line[64];
++	unsigned int i;
++
++	for (i = 0; i < Q2WR_IC_MAX + 2; i++) {
++		snprintf(line, sizeof(line), "calling  f%u+0x0/0x4 @ 1\n", i);
++		feed(s, line);
++	}
++	KUNIT_ASSERT_EQ(test, s->n_ic, (unsigned int)Q2WR_IC_MAX);
++	KUNIT_EXPECT_EQ(test, s->ic_dropped, 2U);
++	KUNIT_EXPECT_STREQ(test, s->ic[0].sym, "f2+0x0/0x4");
++	KUNIT_EXPECT_STREQ(test, s->ic[Q2WR_IC_MAX - 1].sym, "f9+0x0/0x4");
++
++	/* Removing from the middle keeps the order. */
++	feed(s, "initcall f5+0x0/0x4 returned 0 after 1 usecs");
++	KUNIT_ASSERT_EQ(test, s->n_ic, (unsigned int)Q2WR_IC_MAX - 1);
++	KUNIT_EXPECT_STREQ(test, s->ic[2].sym, "f4+0x0/0x4");
++	KUNIT_EXPECT_STREQ(test, s->ic[3].sym, "f6+0x0/0x4");
++}
++
++static void q2wr_test_long_lines(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++	char line[400], sym[200];
++
++	/* A symbol longer than Q2WR_SYM_LEN still matches its own return. */
++	memset(sym, 'z', sizeof(sym) - 1);
++	sym[sizeof(sym) - 1] = '\0';
++	snprintf(line, sizeof(line), "calling  %.60s @ 1", sym);
++	feed(s, line);
++	KUNIT_EXPECT_EQ(test, s->n_ic, 1U);
++	snprintf(line, sizeof(line), "initcall %.60s returned 0 after 1 usecs", sym);
++	feed(s, line);
++	KUNIT_EXPECT_EQ(test, s->n_ic, 0U);
++
++	snprintf(line, sizeof(line), "calling  %.150s @ 1", sym);
++	feed(s, line);
++	KUNIT_ASSERT_EQ(test, s->n_ic, 1U);
++	KUNIT_EXPECT_EQ(test, strlen(s->ic[0].sym), (size_t)Q2WR_SYM_LEN - 1);
++	snprintf(line, sizeof(line), "initcall %.150s returned 0 after 1 usecs", sym);
++	feed(s, line);
++	KUNIT_EXPECT_EQ(test, s->n_ic, 0U);
++
++	/* Over-long line: kept truncated and terminated. */
++	memset(line, 'q', sizeof(line) - 1);
++	line[sizeof(line) - 1] = '\0';
++	feed(s, line);
++	KUNIT_EXPECT_EQ(test, strlen(q2wr_tail_line(s, s->tail_n - 1)),
++			(size_t)Q2WR_LINE_LEN - 1);
++}
++
++static void q2wr_test_tail(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++	char line[32], want[32];
++	unsigned int i;
++
++	feed(s, "first\n");
++	KUNIT_ASSERT_EQ(test, s->tail_n, 1U);
++	KUNIT_EXPECT_STREQ(test, q2wr_tail_line(s, 0), "first");
++
++	for (i = 0; i < Q2WR_TAIL_MAX + 5; i++) {
++		snprintf(line, sizeof(line), "line %u\n", i);
++		feed(s, line);
++	}
++	KUNIT_ASSERT_EQ(test, s->tail_n, (unsigned int)Q2WR_TAIL_MAX);
++	for (i = 0; i < Q2WR_TAIL_MAX; i++) {
++		snprintf(want, sizeof(want), "line %u", i + 5);
++		KUNIT_EXPECT_STREQ(test, q2wr_tail_line(s, i), want);
++	}
++}
++
++static void q2wr_test_not_nul_terminated(struct kunit *test)
++{
++	struct q2wr_scan *s = q2wr_test_scan(test);
++	/* kmsg_dump_get_line() returns a length; the buffer may hold more. */
++	static const char buf[] = "calling  g+0x0/0x4 @ 1\nGARBAGE";
++
++	q2wr_scan_line(s, buf, strlen("calling  g+0x0/0x4 @ 1\n"));
++	KUNIT_ASSERT_EQ(test, s->n_ic, 1U);
++	KUNIT_EXPECT_STREQ(test, s->ic[0].line, "calling  g+0x0/0x4 @ 1");
++}
++
++static struct kunit_case q2wr_test_cases[] = {
++	KUNIT_CASE(q2wr_test_pair),
++	KUNIT_CASE(q2wr_test_pending),
++	KUNIT_CASE(q2wr_test_async),
++	KUNIT_CASE(q2wr_test_unmatched_return),
++	KUNIT_CASE(q2wr_test_not_initcall),
++	KUNIT_CASE(q2wr_test_overflow),
++	KUNIT_CASE(q2wr_test_long_lines),
++	KUNIT_CASE(q2wr_test_tail),
++	KUNIT_CASE(q2wr_test_not_nul_terminated),
++	{}
++};
++
++static struct kunit_suite q2wr_test_suite = {
++	.name = "quest2-warm-reset-stall",
++	.test_cases = q2wr_test_cases,
++};
++
++kunit_test_suite(q2wr_test_suite);
++
++MODULE_DESCRIPTION("KUnit tests for the Quest 2 boot-stall log scan");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/quest2-warm-reset.c b/drivers/misc/quest2-warm-reset.c
+new file mode 100644
+index 000000000..051dc4968
+--- /dev/null
++++ b/drivers/misc/quest2-warm-reset.c
+@@ -0,0 +1,612 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Oculus Quest 2 ("hollywood") DRAM-preserving warm reset back to Android.
++ *
++ * The PM8150 PON PS_HOLD reset type is set to WARM over SPMI and PS_HOLD is
++ * dropped, as in the vendor kernel. PSCI SYSTEM_RESET2 with a warm reset type
++ * hangs in the secure firmware on this device, so no PSCI or SCM call is made,
++ * and nothing goes through kernel_restart()/device_shutdown(). The APSS
++ * watchdog is re-armed with a short bite as a backstop. Only volatile control
++ * registers are written.
++ *
++ * The reset is triggered by writing "r" to /proc/lvr_warm_reset, and optionally
++ * (on_panic=1) when panic() restarts, after kmsg_dump and the panic=N delay, so
++ * ramoops keeps the panic log.
++ *
++ * boot_stall_secs=N optionally panics, after dumping the CPU backtraces,
++ * blocked tasks and the initcalls still running, if init has not been started N
++ * seconds after boot.
++ */
++
++#include <linux/capability.h>
++#include <linux/clk.h>
++#include <linux/console.h>
++#include <linux/cpu.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/kmsg_dump.h>
++#include <linux/module.h>
++#include <linux/nmi.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/panic.h>
++#include <linux/panic_notifier.h>
++#include <linux/pid_namespace.h>
++#include <linux/platform_device.h>
++#include <linux/printk.h>
++#include <linux/proc_fs.h>
++#include <linux/reboot.h>
++#include <linux/regmap.h>
++#include <linux/sched.h>
++#include <linux/sched/debug.h>
++#include <linux/seq_file.h>
++#include <linux/smp.h>
++#include <linux/spmi.h>
++#include <linux/timer.h>
++#include <linux/uaccess.h>
++#include <linux/workqueue.h>
++
++#include "quest2-warm-reset-stall.h"
++
++/* PON registers, offsets from the PON base (0x800 on pm8150@0) */
++#define PON_REVISION2		0x01
++#define PON_PERPH_TYPE		0x04	/* peripheral TYPE, logged only */
++#define PON_PERPH_SUBTYPE	0x05
++#define PON_PS_HOLD_RST_CTL	0x5a
++#define PON_PS_HOLD_RST_CTL2	0x5b
++#define PON_RESET_EN		BIT(7)
++#define PON_POWER_OFF_MASK	0x0f
++
++/* PS_HOLD reset type: warm reset */
++#define PON_POWER_OFF_TYPE_WARM_RESET	0x01
++
++/* PON peripheral subtypes */
++#define PON_PRIMARY		0x01
++#define PON_SECONDARY		0x02
++#define PON_1REG		0x03
++#define PON_GEN2_PRIMARY	0x04
++#define PON_GEN2_SECONDARY	0x05
++
++/* PMIC REVID block (drivers/mfd/qcom-spmi-pmic.c, qcom-spmi-pmic.h) */
++#define PMIC_SUBTYPE_REG	0x105
++#define PM8150_SUBTYPE		0x1e
++
++/* System-reset PMIC PON: PM8150 at USID 0, PON at 0x800 */
++#define QUEST2_PON_USID		0
++#define QUEST2_PON_BASE		0x800
++
++/* APSS WDT0, KPSS register layout as in drivers/watchdog/qcom-wdt.c */
++#define QUEST2_WDT_BASE		0x17c10000
++#define WDT0_RST		0x04
++#define WDT0_EN			0x08
++#define WDT0_BARK_TIME		0x10
++#define WDT0_BITE_TIME		0x14
++
++/* MPM PS_HOLD register */
++#define QUEST2_PS_HOLD_BASE	0x0c264000
++
++static bool on_panic;
++module_param(on_panic, bool, 0444);
++MODULE_PARM_DESC(on_panic, "Warm-reset when panic() restarts (after kmsg_dump and the panic=N delay; default off)");
++
++/*
++ * The boot-stall detector must fire before the APSS watchdog bites, which
++ * happens about 30 s after watchdog.open_timeout expires.
++ */
++#define Q2WR_STALL_MIN_S	20
++#define Q2WR_STALL_MAX_S	75
++static unsigned int boot_stall_secs;
++module_param(boot_stall_secs, uint, 0444);
++MODULE_PARM_DESC(boot_stall_secs, "Panic if init has not been started this many s after boot (0 = off, 20..75)");
++
++static unsigned int bite_ms = 2000;
++module_param(bite_ms, uint, 0444);
++MODULE_PARM_DESC(bite_ms, "Backstop WDT bite before the PS_HOLD drop, ms (500..10000)");
++
++struct quest2_warm_reset {
++	struct device *dev;
++	struct regmap *pon_map;		/* pm8150@0 (USID 0) SPMI regmap */
++	void __iomem *ps_hold;		/* 0x0c264000 */
++	void __iomem *wdt;		/* 0x17c10000, shared with qcom-wdt */
++	unsigned long wdt_rate;		/* sleep clock, Hz */
++	bool armed;
++};
++
++static struct quest2_warm_reset *q2wr;
++static atomic_t q2wr_busy = ATOMIC_INIT(0);
++
++static struct quest2_warm_reset *q2wr_get(void)
++{
++	/* Pairs with the smp_store_release() at the end of q2wr_probe(). */
++	return smp_load_acquire(&q2wr);
++}
++
++static int q2wr_pon_update(struct quest2_warm_reset *w, unsigned int reg,
++			   unsigned int mask, unsigned int val)
++{
++	return regmap_update_bits(w->pon_map, QUEST2_PON_BASE + reg, mask, val);
++}
++
++/*
++ * The sequence. Called with IRQs off on this CPU and the other CPUs stopped.
++ * Never returns.
++ */
++static void __noreturn q2wr_do_warm_reset(struct quest2_warm_reset *w)
++{
++	u32 ticks = DIV_ROUND_UP_ULL((u64)bite_ms * w->wdt_rate, 1000);
++	int rc;
++
++	/*
++	 * 1. Backstop: a short WDT bite, armed as qcom_wdt_restart() does. If
++	 * anything below hangs, the bite resets the SoC within bite_ms.
++	 */
++	writel(0, w->wdt + WDT0_EN);
++	writel(1, w->wdt + WDT0_RST);
++	writel(ticks, w->wdt + WDT0_BARK_TIME);
++	writel(ticks, w->wdt + WDT0_BITE_TIME);
++	writel(1, w->wdt + WDT0_EN);
++	wmb();	/* WDT armed before any PMIC access, as qcom_wdt_restart() */
++
++	/*
++	 * 2. PS_HOLD reset type = WARM: clear RESET_EN, wait 10 sleep clocks
++	 * (+50%), set the type, set RESET_EN. Each regmap write returns only
++	 * once the arbiter reports the SPMI transaction done.
++	 */
++	rc = q2wr_pon_update(w, PON_PS_HOLD_RST_CTL2, PON_RESET_EN, 0);
++	if (!rc) {
++		udelay(500);
++		rc = q2wr_pon_update(w, PON_PS_HOLD_RST_CTL, PON_POWER_OFF_MASK,
++				     PON_POWER_OFF_TYPE_WARM_RESET);
++	}
++	/* Always try to set RESET_EN again, also after a failed type write. */
++	if (q2wr_pon_update(w, PON_PS_HOLD_RST_CTL2, PON_RESET_EN, PON_RESET_EN) || rc)
++		pr_emerg("quest2-warm-reset: PON write failed (%d), WDT bite in %u ms\n",
++			 rc, bite_ms);
++
++	/*
++	 * 3. All prior stores (ramoops is Normal-NC) must reach memory before
++	 * PS_HOLD drops; an SPMI transaction in flight at that point can lock
++	 * up the PMIC.
++	 */
++	mb();	/* step 3 drain, see above */
++
++	/* 4. Drop PS_HOLD. */
++	__raw_writel(0, w->ps_hold);
++	mb();	/* push the PS_HOLD write out before parking */
++
++	/* 5. Park. The PMIC resets the SoC; otherwise the WDT bites. */
++	for (;;)
++		cpu_relax();
++}
++
++static void q2wr_stop_others(void)
++{
++	local_irq_disable();
++	/*
++	 * Like machine_restart(). IPI_CPU_STOP cannot interrupt an IRQ-off
++	 * section, so no other CPU is left inside a regmap/pmic-arb
++	 * transaction.
++	 */
++	smp_send_stop();
++}
++
++static ssize_t q2wr_proc_write(struct file *file, const char __user *ubuf,
++			       size_t count, loff_t *ppos)
++{
++	struct quest2_warm_reset *w = q2wr_get();
++	char buf[2];
++
++	if (!capable(CAP_SYS_BOOT))
++		return -EPERM;
++	if (count < 1 || count > 2)
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	if (buf[0] != 'r' || (count == 2 && buf[1] != '\n'))
++		return -EINVAL;
++	if (!w || !w->armed)
++		return -ENODEV;
++	if (atomic_xchg(&q2wr_busy, 1))
++		return -EBUSY;
++
++	pr_emerg("quest2-warm-reset: userspace requested warm reset (PON WARM + PS_HOLD drop, WDT bite backstop %u ms)\n",
++		 bite_ms);
++	/* Let the consoles, pstore included, catch up */
++	pr_flush(1000, true);
++
++	q2wr_stop_others();
++	q2wr_do_warm_reset(w);
++}
++
++static int q2wr_proc_show(struct seq_file *m, void *v)
++{
++	struct quest2_warm_reset *w = q2wr_get();
++
++	seq_printf(m, "%s\n", w && w->armed ? "armed" : "refused");
++	return 0;
++}
++
++static int q2wr_proc_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, q2wr_proc_show, NULL);
++}
++
++static const struct proc_ops q2wr_proc_ops = {
++	.proc_open	= q2wr_proc_open,
++	.proc_read	= seq_read,
++	.proc_lseek	= seq_lseek,
++	.proc_release	= single_release,
++	.proc_write	= q2wr_proc_write,
++};
++
++/* Restart the WDT count, as qcom_wdt_ping() */
++static void q2wr_wdt_pet(struct quest2_warm_reset *w)
++{
++	if (w && w->wdt)
++		writel(1, w->wdt + WDT0_RST);
++}
++
++/*
++ * Panic notifier (on_panic=1 only). Resetting here would skip kmsg_dump and the
++ * panic=N delay; only pet the WDT so that it cannot bite before the restart
++ * below, also when the panic came from a WDT bark.
++ */
++static int q2wr_panic(struct notifier_block *nb, unsigned long event, void *msg)
++{
++	struct quest2_warm_reset *w = q2wr_get();
++
++	q2wr_wdt_pet(w);
++	pr_emerg("quest2-warm-reset: panic: WDT petted; warm reset when panic() restarts (panic=%d)\n",
++		 panic_timeout);
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block q2wr_panic_nb = {
++	.notifier_call	= q2wr_panic,
++	.priority	= INT_MAX,
++};
++
++/*
++ * Restart handler (on_panic=1 only), above PSCI (129), pinctrl-msm (128) and
++ * qcom-wdt (0). Only a panic restart is turned into a warm reset; any other
++ * restart is left to PSCI.
++ */
++static int q2wr_restart(struct notifier_block *nb, unsigned long mode, void *cmd)
++{
++	struct quest2_warm_reset *w = q2wr_get();
++
++	if (!panic_in_progress())
++		return NOTIFY_DONE;
++	if (!w || !w->armed || atomic_xchg(&q2wr_busy, 1))
++		return NOTIFY_DONE;
++
++	pr_emerg("quest2-warm-reset: panic restart: warm reset (PON WARM + PS_HOLD drop, WDT bite backstop %u ms)\n",
++		 bite_ms);
++	q2wr_stop_others();	/* already done by machine_restart(); no-op */
++	q2wr_do_warm_reset(w);
++}
++
++static struct notifier_block q2wr_restart_nb = {
++	.notifier_call	= q2wr_restart,
++	.priority	= 255,
++};
++
++static struct timer_list q2wr_stall_timer;
++static struct q2wr_scan q2wr_stall_scan;
++static char q2wr_kmsg_line[256];
++
++static void q2wr_stall_scan_log(struct q2wr_scan *s)
++{
++	struct kmsg_dump_iter iter;
++	size_t len;
++
++	q2wr_scan_init(s);
++	kmsg_dump_rewind(&iter);
++	while (kmsg_dump_get_line(&iter, false, q2wr_kmsg_line,
++				  sizeof(q2wr_kmsg_line), &len))
++		q2wr_scan_line(s, q2wr_kmsg_line, len);
++}
++
++static void q2wr_stall_summary(const struct q2wr_scan *s)
++{
++	unsigned int i;
++
++	if (!s->n_ic)
++		pr_emerg("QUEST2-BOOT-STALL: no initcall running (stall after the initcalls, in an async/deferred probe, or initcall_debug off)\n");
++	for (i = 0; i < s->n_ic; i++)
++		pr_emerg("QUEST2-BOOT-STALL: initcall not returned: %s\n", s->ic[i].line);
++	if (s->ic_dropped)
++		pr_emerg("QUEST2-BOOT-STALL: (%u older unreturned initcalls not kept)\n",
++			 s->ic_dropped);
++}
++
++static void q2wr_stall_show_pid1(void)
++{
++	struct task_struct *p;
++
++	rcu_read_lock();
++	p = find_task_by_pid_ns(1, &init_pid_ns);
++	if (p)
++		sched_show_task(p);
++	else
++		pr_emerg("QUEST2-BOOT-STALL: no PID 1\n");
++	rcu_read_unlock();
++}
++
++/*
++ * True once PID 1 has completed an exec: kernel_init() has no mm until /init is
++ * executed. Racy read of a pointer only.
++ */
++static bool q2wr_init_execed(void)
++{
++	struct task_struct *p;
++	bool ret = false;
++
++	rcu_read_lock();
++	p = find_task_by_pid_ns(1, &init_pid_ns);
++	if (p)
++		ret = !!READ_ONCE(p->mm);
++	rcu_read_unlock();
++	return ret;
++}
++
++/*
++ * Timer (softirq) context, like the SysRq handlers that make the same calls.
++ * The short facts are repeated at the end because ramoops keeps the tail of the
++ * log.
++ */
++static void q2wr_stall_fn(struct timer_list *t)
++{
++	struct quest2_warm_reset *w = q2wr_get();
++	struct q2wr_scan *s = &q2wr_stall_scan;
++	enum system_states state = system_state;
++	bool warm = w && w->armed && on_panic;
++	bool execed = q2wr_init_execed();
++	unsigned int i;
++
++	/* Stalled: still before SYSTEM_RUNNING, or /init not executed yet */
++	if (state >= SYSTEM_RUNNING && execed) {
++		pr_info("quest2-warm-reset: boot-stall detector: init started before %u s; idle\n",
++			boot_stall_secs);
++		return;
++	}
++
++	q2wr_wdt_pet(w);
++	q2wr_stall_scan_log(s);
++
++	pr_emerg("QUEST2-BOOT-STALL: init not started %u s after boot (system_state %d, PID 1 exec %s, %u CPUs online); warm reset on panic: %s (driver %s, on_panic %d), panic=%d\n",
++		 boot_stall_secs, state, execed ? "done" : "not done",
++		 num_online_cpus(), warm ? "yes" : "NO",
++		 !w ? "not probed" : w->armed ? "armed" : "refused", on_panic,
++		 panic_timeout);
++	q2wr_stall_summary(s);
++	pr_emerg("QUEST2-BOOT-STALL: last %u log lines before the stall:\n", s->tail_n);
++	for (i = 0; i < s->tail_n; i++)
++		pr_emerg("QUEST2-BOOT-STALL: | %s\n", q2wr_tail_line(s, i));
++
++	pr_emerg("QUEST2-BOOT-STALL: PID 1:\n");
++	q2wr_stall_show_pid1();
++
++	pr_emerg("QUEST2-BOOT-STALL: backtrace of all CPUs:\n");
++	trigger_all_cpu_backtrace();	/* waits <= 10 s for CPUs with IRQs off */
++	q2wr_wdt_pet(w);
++
++	pr_emerg("QUEST2-BOOT-STALL: blocked (D) tasks:\n");
++	show_state_filter(TASK_UNINTERRUPTIBLE);
++	q2wr_wdt_pet(w);
++
++	pr_emerg("QUEST2-BOOT-STALL: busy workqueues:\n");
++	show_all_workqueues();
++
++	pr_emerg("QUEST2-BOOT-STALL: summary again:\n");
++	q2wr_stall_summary(s);
++	pr_emerg("QUEST2-BOOT-STALL: PID 1 again:\n");
++	q2wr_stall_show_pid1();
++	q2wr_wdt_pet(w);
++
++	panic("QUEST2-BOOT-STALL: init not started after %u s", boot_stall_secs);
++}
++
++/*
++ * Armed from an early_initcall, before SMP bring-up and independent of the
++ * probe, which may itself be what stalls. Without the probe the panic ends in a
++ * cold PSCI restart.
++ */
++static int __init q2wr_stall_init(void)
++{
++	if (!boot_stall_secs)
++		return 0;
++	if (boot_stall_secs < Q2WR_STALL_MIN_S || boot_stall_secs > Q2WR_STALL_MAX_S) {
++		pr_err("quest2-warm-reset: boot_stall_secs=%u outside %u..%u; detector off\n",
++		       boot_stall_secs, Q2WR_STALL_MIN_S, Q2WR_STALL_MAX_S);
++		return 0;
++	}
++	timer_setup(&q2wr_stall_timer, q2wr_stall_fn, 0);
++	mod_timer(&q2wr_stall_timer, jiffies + secs_to_jiffies(boot_stall_secs));
++	pr_info("quest2-warm-reset: boot-stall detector armed: panic if init has not started in %u s\n",
++		boot_stall_secs);
++	return 0;
++}
++early_initcall(q2wr_stall_init);
++
++/* Read-only identity checks; decide whether the trigger may be armed. */
++static int q2wr_check_pon(struct quest2_warm_reset *w)
++{
++	unsigned int pmic_sub, type, sub, rev2, ctl, ctl2;
++	int rc;
++
++	rc = regmap_read(w->pon_map, PMIC_SUBTYPE_REG, &pmic_sub);
++	rc = rc ?: regmap_read(w->pon_map, QUEST2_PON_BASE + PON_PERPH_TYPE, &type);
++	rc = rc ?: regmap_read(w->pon_map, QUEST2_PON_BASE + PON_PERPH_SUBTYPE, &sub);
++	rc = rc ?: regmap_read(w->pon_map, QUEST2_PON_BASE + PON_REVISION2, &rev2);
++	rc = rc ?: regmap_read(w->pon_map, QUEST2_PON_BASE + PON_PS_HOLD_RST_CTL, &ctl);
++	rc = rc ?: regmap_read(w->pon_map, QUEST2_PON_BASE + PON_PS_HOLD_RST_CTL2, &ctl2);
++	if (rc) {
++		dev_err(w->dev, "PON read failed: %d; refusing\n", rc);
++		return rc;
++	}
++
++	dev_info(w->dev,
++		 "pmic subtype 0x%02x, PON type 0x%02x subtype 0x%02x rev2 0x%02x, PS_HOLD_RST_CTL 0x%02x CTL2 0x%02x\n",
++		 pmic_sub, type, sub, rev2, ctl, ctl2);
++
++	if (pmic_sub != PM8150_SUBTYPE) {
++		dev_err(w->dev, "USID 0 is not a PM8150 (subtype 0x%02x); refusing\n",
++			pmic_sub);
++		return -ENODEV;
++	}
++
++	/*
++	 * GEN1 PONs with REVISION2 == 0 keep RESET_EN in RST_CTL (0x5A) rather
++	 * than RST_CTL2 (0x5B), which is what is written here. Refuse them and
++	 * unknown subtypes.
++	 */
++	switch (sub) {
++	case PON_PRIMARY:
++	case PON_SECONDARY:
++		if (rev2 == 0) {
++			dev_err(w->dev, "PON is GEN1_V1 (enable bit in 0x5A); refusing\n");
++			return -ENODEV;
++		}
++		break;
++	case PON_1REG:
++	case PON_GEN2_PRIMARY:
++	case PON_GEN2_SECONDARY:
++		break;
++	default:
++		dev_err(w->dev, "unknown PON subtype 0x%02x; refusing\n", sub);
++		return -ENODEV;
++	}
++	return 0;
++}
++
++static int q2wr_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct quest2_warm_reset *w;
++	struct device_node *pon_np, *pmic_np, *wdt_np;
++	struct spmi_device *sdev;
++	struct resource *res, wdt_res;
++	struct clk *clk;
++	u32 pon_reg;
++	int rc;
++
++	if (q2wr)
++		return -EBUSY;
++
++	if (bite_ms < 500 || bite_ms > 10000)
++		return dev_err_probe(dev, -EINVAL, "bite_ms %u out of range\n", bite_ms);
++
++	w = devm_kzalloc(dev, sizeof(*w), GFP_KERNEL);
++	if (!w)
++		return -ENOMEM;
++	w->dev = dev;
++
++	/* PS_HOLD: our own reg, must be exactly 0x0c264000 */
++	w->ps_hold = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(w->ps_hold))
++		return PTR_ERR(w->ps_hold);
++	if (res->start != QUEST2_PS_HOLD_BASE)
++		return dev_err_probe(dev, -EINVAL, "PS_HOLD at %pa, expected 0x%x\n",
++				     &res->start, QUEST2_PS_HOLD_BASE);
++
++	/* APSS WDT: shared with qcom-wdt, so map without requesting the region */
++	wdt_np = of_parse_phandle(dev->of_node, "oculus,apss-wdt", 0);
++	if (!wdt_np)
++		return dev_err_probe(dev, -EINVAL, "no oculus,apss-wdt\n");
++	rc = of_address_to_resource(wdt_np, 0, &wdt_res);
++	if (!rc && (wdt_res.start != QUEST2_WDT_BASE ||
++		    !of_device_is_compatible(wdt_np, "qcom,kpss-wdt")))
++		rc = -EINVAL;
++	if (rc) {
++		of_node_put(wdt_np);
++		return dev_err_probe(dev, rc, "APSS WDT node not as expected\n");
++	}
++	clk = of_clk_get(wdt_np, 0);
++	of_node_put(wdt_np);
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk), "WDT clock\n");
++	w->wdt_rate = clk_get_rate(clk);
++	clk_put(clk);
++	if (w->wdt_rate < 30000 || w->wdt_rate > 40000)
++		return dev_err_probe(dev, -EINVAL, "WDT clock %lu Hz, expected sleep clock\n",
++				     w->wdt_rate);
++	w->wdt = devm_ioremap(dev, wdt_res.start, SZ_4K);
++	if (!w->wdt)
++		return -ENOMEM;
++
++	/* PON: must be pon@800 on the PMIC at SPMI USID 0 */
++	pon_np = of_parse_phandle(dev->of_node, "oculus,pon", 0);
++	if (!pon_np)
++		return dev_err_probe(dev, -EINVAL, "no oculus,pon\n");
++	rc = of_property_read_u32(pon_np, "reg", &pon_reg);
++	pmic_np = of_get_parent(pon_np);
++	of_node_put(pon_np);
++	if (rc || pon_reg != QUEST2_PON_BASE) {
++		of_node_put(pmic_np);
++		return dev_err_probe(dev, -EINVAL, "PON node not at 0x%x\n", QUEST2_PON_BASE);
++	}
++	sdev = spmi_find_device_by_of_node(pmic_np);
++	of_node_put(pmic_np);
++	if (!sdev)
++		return dev_err_probe(dev, -EPROBE_DEFER, "PMIC SPMI device not present\n");
++	if (sdev->usid != QUEST2_PON_USID) {
++		put_device(&sdev->dev);
++		return dev_err_probe(dev, -EINVAL, "PMIC at USID %u, expected %u\n",
++				     sdev->usid, QUEST2_PON_USID);
++	}
++	/* The regmap is devm on the PMIC device (qcom-spmi-pmic.c). */
++	w->pon_map = dev_get_regmap(&sdev->dev, NULL);
++	rc = w->pon_map ? 0 : -EPROBE_DEFER;
++	if (!rc && !device_link_add(dev, &sdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
++		rc = -EINVAL;
++	put_device(&sdev->dev);
++	if (rc)
++		return dev_err_probe(dev, rc, "PMIC regmap / device link\n");
++
++	w->armed = !q2wr_check_pon(w);
++	/* Publish after every field is set: the stall timer and panic read it. */
++	smp_store_release(&q2wr, w);
++
++	if (!proc_create("lvr_warm_reset", 0600, NULL, &q2wr_proc_ops))
++		dev_warn(dev, "cannot create /proc/lvr_warm_reset\n");
++
++	if (w->armed && on_panic) {
++		atomic_notifier_chain_register(&panic_notifier_list, &q2wr_panic_nb);
++		register_restart_handler(&q2wr_restart_nb);
++		/*
++		 * panic=0 never restarts, and a delay above ~25 s lets the
++		 * petted WDT (30 s) bite first.
++		 */
++		if (panic_timeout == 0 || panic_timeout > 20)
++			dev_warn(dev, "panic=%d: the warm reset on panic needs panic=1..20\n",
++				 panic_timeout);
++	}
++
++	dev_info(dev, "%s: PON 0x%x@USID%u, PS_HOLD 0x%x, WDT bite backstop %u ms (%lu Hz), on_panic %d (panic=%d)\n",
++		 w->armed ? "armed" : "REFUSED", QUEST2_PON_BASE, QUEST2_PON_USID,
++		 QUEST2_PS_HOLD_BASE, bite_ms, w->wdt_rate, w->armed && on_panic,
++		 panic_timeout);
++	return 0;
++}
++
++static const struct of_device_id q2wr_of_match[] = {
++	{ .compatible = "oculus,hollywood-warm-reset" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, q2wr_of_match);
++
++static struct platform_driver q2wr_driver = {
++	.probe = q2wr_probe,
++	.driver = {
++		.name = "quest2-warm-reset",
++		.of_match_table = q2wr_of_match,
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(q2wr_driver);
++
++MODULE_DESCRIPTION("Quest 2 warm reset back to Android (PON WARM + PS_HOLD), boot-stall detector");
++MODULE_LICENSE("GPL");

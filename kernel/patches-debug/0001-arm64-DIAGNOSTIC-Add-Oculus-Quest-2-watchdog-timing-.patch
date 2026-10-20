@@ -1,0 +1,287 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 1/2] arm64: DIAGNOSTIC: Add Oculus Quest 2 watchdog-timing
+ boot beacon
+
+Debug aid for kernels that hang early after the kexec handoff on the
+Oculus Quest 2, which has no serial console. Not for upstream.
+
+Five early boot checkpoints (primary_entry, after paging_init(), before
+rest_init(), after smp_init(), before the device initcalls) each wait
+21 s and re-arm the APSS watchdog with a 31.5 s bite, so the time from
+the handoff to the watchdog reset shows the last checkpoint reached.
+This adds about 84 s to every boot and hard-codes an SM8250 address.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ arch/arm64/Kconfig.platforms               | 10 ++++
+ arch/arm64/include/asm/quest2_wdt_beacon.h | 32 +++++++++++
+ arch/arm64/kernel/Makefile                 |  1 +
+ arch/arm64/kernel/head.S                   | 20 +++++++
+ arch/arm64/kernel/quest2_wdt_beacon.c      | 64 ++++++++++++++++++++++
+ arch/arm64/kernel/setup.c                  |  3 +
+ include/linux/quest2_wdt_beacon.h          | 12 ++++
+ init/main.c                                |  7 +++
+ 8 files changed, 149 insertions(+)
+ create mode 100644 arch/arm64/include/asm/quest2_wdt_beacon.h
+ create mode 100644 arch/arm64/kernel/quest2_wdt_beacon.c
+ create mode 100644 include/linux/quest2_wdt_beacon.h
+
+diff --git a/arch/arm64/Kconfig.platforms b/arch/arm64/Kconfig.platforms
+index 13173795c..c4fae333c 100644
+--- a/arch/arm64/Kconfig.platforms
++++ b/arch/arm64/Kconfig.platforms
+@@ -319,6 +319,16 @@ config ARCH_QCOM
+ 	help
+ 	  This enables support for the ARMv8 based Qualcomm chipsets.
+ 
++config QUEST2_DIAG_WDT_BEACON
++	bool "Oculus Quest 2 diagnostic: APSS watchdog-timing boot beacon"
++	depends on ARCH_QCOM
++	help
++	  DIAGNOSTIC ONLY, for early boot hangs on the Oculus Quest 2. Early
++	  boot checkpoints re-arm the APSS watchdog with a 31.5 s bite after
++	  a 21 s pause each, so the time to the watchdog reset shows the last
++	  checkpoint reached. Adds about 84 s to every boot. The watchdog
++	  address is hard-coded for SM8250.
++
+ config ARCH_REALTEK
+ 	bool "Realtek Platforms"
+ 	select RESET_CONTROLLER
+diff --git a/arch/arm64/include/asm/quest2_wdt_beacon.h b/arch/arm64/include/asm/quest2_wdt_beacon.h
+new file mode 100644
+index 000000000..7a4182249
+--- /dev/null
++++ b/arch/arm64/include/asm/quest2_wdt_beacon.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * DIAGNOSTIC ONLY (Oculus Quest 2).
++ *
++ * Watchdog-timing beacon: early boot checkpoints re-arm the APSS watchdog,
++ * so the time from the kexec handoff to the SoC reset shows the last
++ * checkpoint reached. Checkpoint Ci is armed 21 * i s after the handoff and
++ * a hang after it bites at 21 * i + 31.5 s; the bites fall halfway between
++ * the arm times. The bark interrupt stays off: nothing handles it this
++ * early.
++ */
++#ifndef __ASM_QUEST2_WDT_BEACON_H
++#define __ASM_QUEST2_WDT_BEACON_H
++
++#define QUEST2_WDT_BEACON_BASE		0x17c10000
++#define QUEST2_WDT_BEACON_RST		0x04
++#define QUEST2_WDT_BEACON_EN		0x08
++#define QUEST2_WDT_BEACON_BARK		0x10
++#define QUEST2_WDT_BEACON_BITE		0x14
++
++#define QUEST2_WDT_BEACON_SCLK_HZ	32764
++#define QUEST2_WDT_BEACON_SPIN_S	21
++/* bite 31.5 s: 31.5 * 32764 Hz = 1032066 = 0xfbf82, below the 0xfffff limit */
++#define QUEST2_WDT_BEACON_BITE_DS	315
++#define QUEST2_WDT_BEACON_TICKS		1032066
++
++#ifndef __ASSEMBLY__
++#include <linux/init.h>
++void __init quest2_wdt_beacon(int checkpoint);
++#endif
++
++#endif /* __ASM_QUEST2_WDT_BEACON_H */
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 76f32e424..0bae889be 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -77,6 +77,7 @@ $(obj)/vdso32-wrap.o: $(obj)/vdso32/vdso.so
+ 
+ obj-y					+= probes/
+ obj-y					+= head.o
++obj-$(CONFIG_QUEST2_DIAG_WDT_BEACON)	+= quest2_wdt_beacon.o
+ always-$(KBUILD_BUILTIN)		+= vmlinux.lds
+ 
+ ifeq ($(CONFIG_DEBUG_EFI),y)
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index ca04b338c..bf2f64847 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -35,6 +35,7 @@
+ #include <asm/stacktrace/frame.h>
+ #include <asm/thread_info.h>
+ #include <asm/virt.h>
++#include <asm/quest2_wdt_beacon.h>
+ 
+ #include "efi-header.S"
+ 
+@@ -84,6 +85,25 @@
+ 	 */
+ SYM_CODE_START(primary_entry)
+ 	bl	record_mmu_state
++#ifdef CONFIG_QUEST2_DIAG_WDT_BEACON
++	/*
++	 * DIAGNOSTIC ONLY, beacon checkpoint C0. Only with the MMU off, since
++	 * the address is physical. x0-x3 hold the boot arguments and x19 is
++	 * in use, so only x9/x10 are touched.
++	 */
++	mrs	x9, sctlr_el1
++	tbnz	x9, #0, 9f
++	mov_q	x9, QUEST2_WDT_BEACON_BASE
++	str	wzr, [x9, #QUEST2_WDT_BEACON_EN]
++	mov_q	x10, QUEST2_WDT_BEACON_TICKS
++	str	w10, [x9, #QUEST2_WDT_BEACON_BARK]
++	str	w10, [x9, #QUEST2_WDT_BEACON_BITE]
++	mov	w10, #1
++	str	w10, [x9, #QUEST2_WDT_BEACON_EN]
++	str	w10, [x9, #QUEST2_WDT_BEACON_RST]
++	dsb	sy
++9:
++#endif
+ 	bl	preserve_boot_args
+ 
+ 	adrp	x1, early_init_stack
+diff --git a/arch/arm64/kernel/quest2_wdt_beacon.c b/arch/arm64/kernel/quest2_wdt_beacon.c
+new file mode 100644
+index 000000000..4a725916f
+--- /dev/null
++++ b/arch/arm64/kernel/quest2_wdt_beacon.c
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * DIAGNOSTIC ONLY (Oculus Quest 2): checkpoints C1-C4 of the watchdog-timing
++ * beacon, see asm/quest2_wdt_beacon.h. C0 is in head.S. qcom_wdt later finds
++ * the watchdog running and keeps pinging it.
++ */
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/printk.h>
++#include <linux/sizes.h>
++#include <asm/arch_timer.h>
++#include <asm/early_ioremap.h>
++#include <asm/quest2_wdt_beacon.h>
++#include <asm/sysreg.h>
++
++static void __init quest2_wdt_beacon_spin(void)
++{
++	u64 freq = read_sysreg(cntfrq_el0);
++	u64 start, cycles;
++
++	if (!freq)
++		freq = 19200000;	/* sm8250 arch timer (sm8250.dtsi) */
++	cycles = freq * QUEST2_WDT_BEACON_SPIN_S;
++
++	start = __arch_counter_get_cntvct();
++	while (__arch_counter_get_cntvct() - start < cycles)
++		cpu_relax();
++}
++
++static void __init quest2_wdt_beacon_arm(void __iomem *wdt)
++{
++	writel_relaxed(0, wdt + QUEST2_WDT_BEACON_EN);
++	writel_relaxed(QUEST2_WDT_BEACON_TICKS, wdt + QUEST2_WDT_BEACON_BARK);
++	writel_relaxed(QUEST2_WDT_BEACON_TICKS, wdt + QUEST2_WDT_BEACON_BITE);
++	writel_relaxed(1, wdt + QUEST2_WDT_BEACON_EN);
++	writel_relaxed(1, wdt + QUEST2_WDT_BEACON_RST);
++	mb();	/* WDT armed before execution continues */
++}
++
++void __init quest2_wdt_beacon(int checkpoint)
++{
++	void __iomem *wdt;
++
++	quest2_wdt_beacon_spin();
++
++	if (checkpoint == 1) {
++		/* before early_ioremap_reset(); ioremap() is not up yet */
++		wdt = early_ioremap(QUEST2_WDT_BEACON_BASE, SZ_4K);
++		if (!wdt)
++			return;
++		quest2_wdt_beacon_arm(wdt);
++		early_iounmap(wdt, SZ_4K);
++	} else {
++		wdt = ioremap(QUEST2_WDT_BEACON_BASE, SZ_4K);
++		if (!wdt)
++			return;
++		quest2_wdt_beacon_arm(wdt);
++		iounmap(wdt);
++	}
++
++	pr_info("quest2-diag: WDT beacon C%d armed, bite %u.%u s\n",
++		checkpoint, QUEST2_WDT_BEACON_BITE_DS / 10,
++		QUEST2_WDT_BEACON_BITE_DS % 10);
++}
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 23c05dc7a..74f1f2db0 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -29,6 +29,7 @@
+ #include <linux/of_fdt.h>
+ #include <linux/efi.h>
+ #include <linux/psci.h>
++#include <linux/quest2_wdt_beacon.h>
+ #include <linux/sched/task.h>
+ #include <linux/scs.h>
+ #include <linux/mm.h>
+@@ -333,6 +334,8 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 
+ 	paging_init();
+ 
++	quest2_wdt_beacon(1);	/* DIAGNOSTIC ONLY */
++
+ 	acpi_table_upgrade();
+ 
+ 	/* Parse the ACPI tables for possible boot-time configuration */
+diff --git a/include/linux/quest2_wdt_beacon.h b/include/linux/quest2_wdt_beacon.h
+new file mode 100644
+index 000000000..74f751c7d
+--- /dev/null
++++ b/include/linux/quest2_wdt_beacon.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* DIAGNOSTIC ONLY: see arch/arm64/include/asm/quest2_wdt_beacon.h */
++#ifndef __LINUX_QUEST2_WDT_BEACON_H
++#define __LINUX_QUEST2_WDT_BEACON_H
++
++#ifdef CONFIG_QUEST2_DIAG_WDT_BEACON
++#include <asm/quest2_wdt_beacon.h>
++#else
++static inline void quest2_wdt_beacon(int checkpoint) { }
++#endif
++
++#endif /* __LINUX_QUEST2_WDT_BEACON_H */
+diff --git a/init/main.c b/init/main.c
+index 269b30038..e4c5544de 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -35,6 +35,7 @@
+ #include <linux/percpu.h>
+ #include <linux/kmod.h>
+ #include <linux/kprobes.h>
++#include <linux/quest2_wdt_beacon.h>
+ #include <linux/kmsan.h>
+ #include <linux/vmalloc.h>
+ #include <linux/kernel_stat.h>
+@@ -1067,6 +1068,8 @@ void start_kernel(void)
+ 	arch_post_acpi_subsys_init();
+ 	kcsan_init();
+ 
++	quest2_wdt_beacon(2);	/* DIAGNOSTIC ONLY */
++
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	rest_init();
+ 
+@@ -1316,6 +1319,9 @@ static void __init do_initcalls(void)
+ 		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
+ 
+ 	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
++		/* DIAGNOSTIC ONLY: checkpoint C4 before the device level */
++		if (!strcmp(initcall_level_names[level], "device"))
++			quest2_wdt_beacon(4);
+ 		/* Parser modifies command_line, restore it each time */
+ 		strcpy(command_line, saved_command_line);
+ 		do_initcall_level(level, command_line);
+@@ -1543,6 +1549,7 @@ static noinline void __init kernel_init_freeable(void)
+ 	lockup_detector_init();
+ 
+ 	smp_init();
++	quest2_wdt_beacon(3);	/* DIAGNOSTIC ONLY */
+ 	sched_init_smp();
+ 
+ 	workqueue_init_topology();

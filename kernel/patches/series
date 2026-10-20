@@ -1,0 +1,16 @@
+0001-dt-bindings-arm-qcom-Add-Oculus-Quest-2-hollywood.patch
+0002-dt-bindings-misc-Add-Oculus-Quest-2-syncboss-MCU.patch
+0003-dt-bindings-iommu-arm-smmu-Add-Oculus-Quest-2-apps-S.patch
+0004-dt-bindings-power-reset-Add-Oculus-Quest-2-warm-rese.patch
+0005-spmi-pmic-arb-Optionally-mask-PMIC-interrupts-inheri.patch
+0006-firmware-qcom_scm-Make-no-SCM-calls-the-device-firmw.patch
+0007-soc-qcom-geni-se-Allow-a-node-without-the-DDR-path.patch
+0008-spi-spi-geni-qcom-Keep-the-SE-interrupt-off-while-ru.patch
+0009-usb-dwc3-qcom-legacy-Quiesce-the-controller-on-shutd.patch
+0010-drm-msm-a6xx-Add-zap_preloaded-module-parameter.patch
+0011-iommu-arm-smmu-Add-inherit-mode-for-an-SMMU-left-liv.patch
+0012-iommu-arm-smmu-Add-KUnit-tests-for-inherit-mode.patch
+0013-misc-Add-Oculus-Quest-2-syncboss-SPI-link-driver.patch
+0014-misc-Add-Oculus-Quest-2-warm-reset-driver.patch
+0015-arm64-dts-qcom-Add-Oculus-Quest-2-hollywood.patch
+0016-arm64-configs-Add-Oculus-Quest-2-config-fragments.patch

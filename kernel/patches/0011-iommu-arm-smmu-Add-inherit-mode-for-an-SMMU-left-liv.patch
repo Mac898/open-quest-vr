@@ -1,0 +1,1030 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 11/16] iommu/arm-smmu: Add inherit mode for an SMMU left live
+ across kexec
+
+On the Oculus Quest 2 Linux is started by kexec from Android. The apps
+MMU-500 is still in use: some stream map entries and context banks
+belong to the secure world, and the storage streams depend on its
+global configuration. The normal probe resets all of it.
+
+Add an inherit mode, selected by "oculus,hollywood-apps-smmu-inherit".
+The probe never resets the SMMU; it reads the stream map and reserves
+every valid entry and every context bank they point at. A master may
+attach only if its stream ID is in "oculus,inherit-attach-sids" and an
+inherited entry matches exactly that ID with mask 0; it takes that
+entry over and gets a free context bank, which is fully programmed
+before the entry points at it. Entries are never freed, and S2CRs of
+type BYPASS or FAULT are never written.
+
+Every register access in this mode goes through
+arm_smmu_inherit_access_ok(), which allows only what these paths need.
+A read-only dump of the stream map is logged at probe and after each
+attach.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c |  13 +
+ drivers/iommu/arm/arm-smmu/arm-smmu.c      | 683 ++++++++++++++++++++-
+ drivers/iommu/arm/arm-smmu/arm-smmu.h      |  33 +
+ 3 files changed, 705 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+index f7cb7de80..de0fb40eb 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+@@ -72,6 +72,10 @@ static void qcom_smmu_tlb_sync(struct arm_smmu_device *smmu, int page,
+ 		udelay(delay);
+ 	}
+ 
++	/* Inherit mode (Quest 2 apps SMMU): say so, as arm-smmu.c does */
++	if (smmu->inherit)
++		dev_err_ratelimited(smmu->dev,
++				    "TLB sync timed out -- SMMU may be deadlocked\n");
+ 	qcom_smmu_tlb_sync_debug(smmu);
+ }
+ 
+@@ -424,6 +428,13 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
+ 	u32 smr;
+ 	int i;
+ 
++	/*
++	 * Inherit mode (Quest 2 apps SMMU) never runs this: the quirk probe
++	 * below writes an S2CR of type BYPASS and programs a context bank.
++	 */
++	if (WARN_ON(smmu->inherit))
++		return -EINVAL;
++
+ 	/*
+ 	 * MSM8998 LPASS SMMU reports 13 context banks, but accessing
+ 	 * the last context bank crashes the system.
+@@ -734,6 +745,8 @@ static const struct of_device_id __maybe_unused qcom_smmu_impl_of_match[] = {
+ 	{ .compatible = "qcom,sm8350-smmu-500", .data = &qcom_smmu_500_impl0_data },
+ 	{ .compatible = "qcom,sm8450-smmu-500", .data = &qcom_smmu_500_impl0_data },
+ 	{ .compatible = "qcom,smmu-500", .data = &qcom_smmu_500_impl0_data },
++	/* Quest 2 apps SMMU (SM8250 MMU-500) in inherit mode, see arm-smmu.c */
++	{ .compatible = "oculus,hollywood-apps-smmu-inherit", .data = &qcom_smmu_500_impl0_data },
+ 	{ }
+ };
+ 
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu.c b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+index 488632b8e..d9deca5f7 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+@@ -69,6 +69,32 @@ MODULE_PARM_DESC(disable_bypass,
+ 
+ static bool using_legacy_binding, using_generic_binding;
+ 
++/*
++ * Inherit mode, for an SMMU that is live when this kernel starts (the Oculus
++ * Quest 2 apps SMMU after kexec from Android). Some of its stream map entries
++ * and context banks belong to the secure world, and the storage streams depend
++ * on its global configuration, so it is never reset. The probe only reads the
++ * stream map and marks every valid entry, and every bank one points at, as in
++ * use.
++ *
++ * A master may attach only if its stream ID is in oculus,inherit-attach-sids
++ * and an inherited entry matches exactly that ID with mask 0. It takes that
++ * entry over and gets a free context bank; the old bank stays reserved.
++ *
++ * Every register access goes through arm_smmu_inherit_access_ok().
++ */
++static bool arm_smmu_inherit_sid_allowed(struct arm_smmu_device *smmu, u16 sid)
++{
++	int i;
++
++	for (i = 0; i < smmu->num_inherit_sids; i++)
++		if (smmu->inherit_sids[i] == sid)
++			return true;
++	return false;
++}
++
++static int arm_smmu_inherit_dump(struct arm_smmu_device *smmu, const char *tag);
++
+ static inline int arm_smmu_rpm_get(struct arm_smmu_device *smmu)
+ {
+ 	if (pm_runtime_enabled(smmu->dev))
+@@ -801,6 +827,9 @@ static int arm_smmu_init_domain_context(struct arm_smmu_domain *smmu_domain,
+ 
+ 	if (smmu_domain->stage == ARM_SMMU_DOMAIN_S2)
+ 		cfg->vmid = cfg->cbndx + 1;
++	else if (smmu->inherit)
++		/* above every inherited ASID: no TLB entry shared with them */
++		cfg->asid = ARM_SMMU_INHERIT_ASID_BASE + cfg->cbndx;
+ 	else
+ 		cfg->asid = cfg->cbndx;
+ 
+@@ -840,6 +869,14 @@ static int arm_smmu_init_domain_context(struct arm_smmu_domain *smmu_domain,
+ 
+ 	domain->geometry.force_aperture = true;
+ 
++	/*
++	 * Inherit mode: nothing reset this bank. Clear any stale fault status
++	 * before its fault interrupt is enabled.
++	 */
++	if (smmu->inherit)
++		arm_smmu_cb_write(smmu, cfg->cbndx, ARM_SMMU_CB_FSR,
++				  ARM_SMMU_CB_FSR_FAULT);
++
+ 	/* Initialise the context bank with our page table cfg */
+ 	arm_smmu_init_context_bank(smmu_domain, &pgtbl_cfg);
+ 	arm_smmu_write_context_bank(smmu, cfg->cbndx);
+@@ -997,7 +1034,7 @@ static void arm_smmu_test_smr_masks(struct arm_smmu_device *smmu)
+ 	u32 smr;
+ 	int i;
+ 
+-	if (!smmu->smrs)
++	if (!smmu->smrs || WARN_ON(smmu->inherit))
+ 		return;
+ 	/*
+ 	 * If we've had to accommodate firmware memory regions, we may
+@@ -1056,8 +1093,17 @@ static int arm_smmu_find_sme(struct arm_smmu_device *smmu, u16 id, u16 mask)
+ 		 * no harm in accommodating the generalisation.
+ 		 */
+ 		if ((mask & smrs[i].mask) == mask &&
+-		    !((id ^ smrs[i].id) & ~smrs[i].mask))
++		    !((id ^ smrs[i].id) & ~smrs[i].mask)) {
++			/*
++			 * Inherit mode: an inherited entry is only taken over
++			 * by a master with exactly its ID and no mask, so no
++			 * other stream it matches is re-pointed.
++			 */
++			if (smmu->inherit && test_bit(i, smmu->inherit_smes) &&
++			    (smrs[i].mask || mask || smrs[i].id != id))
++				return -EPERM;
+ 			return i;
++		}
+ 		/*
+ 		 * If the new entry has any other overlap with an existing one,
+ 		 * though, then there always exists at least one stream ID
+@@ -1067,11 +1113,37 @@ static int arm_smmu_find_sme(struct arm_smmu_device *smmu, u16 id, u16 mask)
+ 			return -EINVAL;
+ 	}
+ 
++	/*
++	 * Inherit mode: a master only takes over an inherited entry. It never
++	 * claims a free one, which would add a stream match for an ID the
++	 * previous OS left unmatched.
++	 */
++	if (smmu->inherit) {
++		dev_err(smmu->dev, "inherit: no inherited stream map entry for ID %#x mask %#x\n",
++			id, mask);
++		return -EPERM;
++	}
++
+ 	return free_idx;
+ }
+ 
+ static bool arm_smmu_free_sme(struct arm_smmu_device *smmu, int idx)
+ {
++	/*
++	 * Inherit mode: stream map entries stay pinned. Releasing one would
++	 * write an S2CR of type FAULT or BYPASS and invalidate its SMR.
++	 */
++	if (smmu->inherit) {
++		/*
++		 * Every entry keeps the reference the probe seeded. When the
++		 * last master lets go, forget its group, which the core frees
++		 * with that master; a later master gets a new one.
++		 */
++		if (smmu->s2crs[idx].count > 1 && --smmu->s2crs[idx].count == 1)
++			smmu->s2crs[idx].group = NULL;
++		return false;
++	}
++
+ 	if (--smmu->s2crs[idx].count)
+ 		return false;
+ 
+@@ -1106,6 +1178,9 @@ static int arm_smmu_master_alloc_smes(struct device *dev)
+ 			goto out_err;
+ 
+ 		idx = ret;
++		if (smmu->inherit && test_and_clear_bit(idx, smmu->inherit_smes))
++			dev_info(dev, "inherit: taking over SME %d (SID %#x), its CB%u stays reserved\n",
++				 idx, sid, smmu->s2crs[idx].cbndx);
+ 		if (smrs && smmu->s2crs[idx].count == 0) {
+ 			smrs[idx].id = sid;
+ 			smrs[idx].mask = mask;
+@@ -1115,9 +1190,13 @@ static int arm_smmu_master_alloc_smes(struct device *dev)
+ 		cfg->smendx[i] = (s16)idx;
+ 	}
+ 
+-	/* It worked! Now, poke the actual hardware */
+-	for_each_cfg_sme(cfg, fwspec, i, idx)
+-		arm_smmu_write_sme(smmu, idx);
++	/*
++	 * It worked! Now, poke the actual hardware. Inherit mode writes the
++	 * entry only at attach, once its bank is programmed.
++	 */
++	if (!smmu->inherit)
++		for_each_cfg_sme(cfg, fwspec, i, idx)
++			arm_smmu_write_sme(smmu, idx);
+ 
+ 	mutex_unlock(&smmu->stream_map_mutex);
+ 	return 0;
+@@ -1152,6 +1231,7 @@ static void arm_smmu_master_install_s2crs(struct arm_smmu_master_cfg *cfg,
+ {
+ 	struct arm_smmu_device *smmu = cfg->smmu;
+ 	struct arm_smmu_s2cr *s2cr = smmu->s2crs;
++	bool written = false;
+ 	int i, idx;
+ 
+ 	for_each_cfg_sme(cfg, fwspec, i, idx) {
+@@ -1161,30 +1241,39 @@ static void arm_smmu_master_install_s2crs(struct arm_smmu_master_cfg *cfg,
+ 		s2cr[idx].type = type;
+ 		s2cr[idx].privcfg = S2CR_PRIVCFG_DEFAULT;
+ 		s2cr[idx].cbndx = cbndx;
+-		arm_smmu_write_s2cr(smmu, idx);
++		if (smmu->inherit)
++			arm_smmu_write_sme(smmu, idx);
++		else
++			arm_smmu_write_s2cr(smmu, idx);
++		written = true;
+ 	}
++
++	if (smmu->inherit && written)
++		arm_smmu_inherit_dump(smmu, "attach");
+ }
+ 
+-static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
++/*
++ * Finalise the domain on its context bank and point the master's stream map
++ * entries at it. In inherit mode the bank is fully programmed and its ASID
++ * invalidated before the S2CR, then the SMR, is written, and the number of
++ * register writes (SMMU-wide) is logged.
++ */
++static int arm_smmu_attach_cfg(struct arm_smmu_domain *smmu_domain,
++			       struct device *dev,
++			       struct arm_smmu_master_cfg *cfg,
++			       struct iommu_fwspec *fwspec)
+ {
+-	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+-	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+-	struct arm_smmu_master_cfg *cfg;
+-	struct arm_smmu_device *smmu;
+-	int ret;
++	struct arm_smmu_device *smmu = cfg->smmu;
++	int ret, writes = 0, refused = 0;
+ 
+-	/*
+-	 * FIXME: The arch/arm DMA API code tries to attach devices to its own
+-	 * domains between of_xlate() and probe_device() - we have no way to cope
+-	 * with that, so until ARM gets converted to rely on groups and default
+-	 * domains, just say no (but more politely than by dereferencing NULL).
+-	 * This should be at least a WARN_ON once that's sorted.
+-	 */
+-	cfg = dev_iommu_priv_get(dev);
+-	if (!cfg)
+-		return -ENODEV;
++	/* Inherit mode: no attach without a live allowlist */
++	if (smmu->inherit && !smmu->inherit_attach)
++		return -EPERM;
+ 
+-	smmu = cfg->smmu;
++	if (smmu->inherit) {
++		writes = atomic_read(&smmu->inherit_writes);
++		refused = atomic_read(&smmu->inherit_refused);
++	}
+ 
+ 	ret = arm_smmu_rpm_get(smmu);
+ 	if (ret < 0)
+@@ -1204,14 +1293,51 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
+ 		goto rpm_put;
+ 	}
+ 
++	/*
++	 * Inherit mode: no global TLB invalidation ran at probe. Invalidate
++	 * the domain's ASID on its own bank before a stream points at it.
++	 */
++	if (smmu->inherit)
++		smmu_domain->flush_ops->tlb_flush_all(smmu_domain);
++
+ 	/* Looks ok, so add the device to the domain */
+ 	arm_smmu_master_install_s2crs(cfg, S2CR_TYPE_TRANS,
+ 				      smmu_domain->cfg.cbndx, fwspec);
+ rpm_put:
+ 	arm_smmu_rpm_put(smmu);
++	if (smmu->inherit) {
++		writes = atomic_read(&smmu->inherit_writes) - writes;
++		refused = atomic_read(&smmu->inherit_refused) - refused;
++		if (ret)
++			dev_info(dev, "inherit: attach failed (%d), %d register writes, %d refused\n",
++				 ret, writes, refused);
++		else
++			dev_info(dev, "inherit: attached to CB%u, %d register writes, %d refused\n",
++				 smmu_domain->cfg.cbndx, writes, refused);
++	}
+ 	return ret;
+ }
+ 
++static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
++{
++	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
++	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
++	struct arm_smmu_master_cfg *cfg;
++
++	/*
++	 * FIXME: The arch/arm DMA API code tries to attach devices to its own
++	 * domains between of_xlate() and probe_device() - we have no way to cope
++	 * with that, so until ARM gets converted to rely on groups and default
++	 * domains, just say no (but more politely than by dereferencing NULL).
++	 * This should be at least a WARN_ON once that's sorted.
++	 */
++	cfg = dev_iommu_priv_get(dev);
++	if (!cfg)
++		return -ENODEV;
++
++	return arm_smmu_attach_cfg(smmu_domain, dev, cfg, fwspec);
++}
++
+ static int arm_smmu_attach_dev_type(struct device *dev,
+ 				    enum arm_smmu_s2cr_type type)
+ {
+@@ -1224,6 +1350,10 @@ static int arm_smmu_attach_dev_type(struct device *dev,
+ 		return -ENODEV;
+ 	smmu = cfg->smmu;
+ 
++	/* Inherit mode: no S2CR of type BYPASS or FAULT, ever */
++	if (smmu->inherit)
++		return -EPERM;
++
+ 	ret = arm_smmu_rpm_get(smmu);
+ 	if (ret < 0)
+ 		return ret;
+@@ -1390,7 +1520,13 @@ static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
+ 	if (!ops)
+ 		return 0;
+ 
++	/*
++	 * Never in inherit mode (whose probe does not set TRANS_OPS either):
++	 * the hardware walk polls ATSR with a raw read that skips
++	 * arm_smmu_inherit_access_ok().
++	 */
+ 	if (smmu_domain->smmu->features & ARM_SMMU_FEAT_TRANS_OPS &&
++			!smmu_domain->smmu->inherit &&
+ 			smmu_domain->stage == ARM_SMMU_DOMAIN_S1)
+ 		return arm_smmu_iova_to_phys_hard(domain, iova);
+ 
+@@ -1465,6 +1601,14 @@ static struct iommu_device *arm_smmu_probe_device(struct device *dev)
+ 				mask, smmu->smr_mask_mask);
+ 			goto out_free;
+ 		}
++		if (smmu->inherit &&
++		    (!smmu->inherit_attach || mask ||
++		     !arm_smmu_inherit_sid_allowed(smmu, sid))) {
++			dev_err(dev, "inherit: stream ID 0x%x mask 0x%x is not on the attach allowlist\n",
++				sid, mask);
++			ret = -EPERM;
++			goto out_free;
++		}
+ 	}
+ 
+ 	ret = -ENOMEM;
+@@ -1660,6 +1804,10 @@ static void arm_smmu_device_reset(struct arm_smmu_device *smmu)
+ 	int i;
+ 	u32 reg;
+ 
++	/* Inherit mode never resets; its probe does not call this */
++	if (WARN(smmu->inherit, "arm-smmu: inherit mode: refusing reset\n"))
++		return;
++
+ 	/* clear global FSR */
+ 	reg = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSR);
+ 	arm_smmu_gr0_write(smmu, ARM_SMMU_GR0_sGFSR, reg);
+@@ -1743,6 +1891,10 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
+ 	bool cttw_reg, cttw_fw = smmu->features & ARM_SMMU_FEAT_COHERENT_WALK;
+ 	int i, ret;
+ 
++	/* Inherit mode uses arm_smmu_inherit_cfg_probe() */
++	if (WARN_ON(smmu->inherit))
++		return -EINVAL;
++
+ 	dev_notice(smmu->dev, "probing hardware configuration...\n");
+ 	dev_notice(smmu->dev, "SMMUv%d with:\n",
+ 			smmu->version == ARM_SMMU_V2 ? 2 : 1);
+@@ -1936,9 +2088,460 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
+ 	return 0;
+ }
+ 
++/*
++ * Inherit mode register access rules. Without masters only ID0, ID1, the SMRs
++ * and the S2CRs of valid SMRs may be read, and nothing written. With masters,
++ * additionally: ID2; the S2CR (TRANS, to an owned bank) and SMR (same ID, mask
++ * 0, VALID) of an entry a master took over; and in a bank this driver
++ * allocated, CBAR, CBA2R, CBFRSYNRA and the registers the stage-1 attach, TLB,
++ * fault and teardown paths use. Everything else is refused, sCR0 and all other
++ * global registers included.
++ */
++static bool arm_smmu_inherit_smr_write_ok(struct arm_smmu_device *smmu,
++					  unsigned int n, u32 val)
++{
++	if (test_bit(n, smmu->inherit_smes) || !smmu->smrs[n].valid ||
++	    smmu->smrs[n].mask || !(val & ARM_SMMU_SMR_VALID))
++		return false;
++	val &= ~ARM_SMMU_SMR_VALID;
++	return !FIELD_GET(ARM_SMMU_SMR_MASK, val) &&
++	       FIELD_GET(ARM_SMMU_SMR_ID, val) == smmu->smrs[n].id &&
++	       arm_smmu_inherit_sid_allowed(smmu, FIELD_GET(ARM_SMMU_SMR_ID, val));
++}
++
++/* A bank this driver allocated for a domain: never an inherited one */
++static bool arm_smmu_inherit_cb_owned(struct arm_smmu_device *smmu,
++				      unsigned int n)
++{
++	return n < smmu->num_context_banks &&
++	       test_bit(n, smmu->context_map) && !test_bit(n, smmu->inherit_cbs);
++}
++
++static bool arm_smmu_inherit_s2cr_write_ok(struct arm_smmu_device *smmu,
++					   unsigned int n, u32 val)
++{
++	return !test_bit(n, smmu->inherit_smes) &&
++	       smmu->smrs[n].valid && !smmu->smrs[n].mask &&
++	       arm_smmu_inherit_sid_allowed(smmu, smmu->smrs[n].id) &&
++	       FIELD_GET(ARM_SMMU_S2CR_TYPE, val) == S2CR_TYPE_TRANS &&
++	       !(val & ARM_SMMU_S2CR_EXIDVALID) &&
++	       arm_smmu_inherit_cb_owned(smmu, FIELD_GET(ARM_SMMU_S2CR_CBNDX, val));
++}
++
++/* Offsets in an owned bank's page; 64-bit accesses pass their low offset */
++static bool arm_smmu_inherit_cb_reg_ok(int offset, bool write)
++{
++	switch (offset) {
++	case ARM_SMMU_CB_SCTLR:
++	case ARM_SMMU_CB_RESUME:
++	case ARM_SMMU_CB_TCR2:
++	case ARM_SMMU_CB_TTBR0:
++	case ARM_SMMU_CB_TTBR1:
++	case ARM_SMMU_CB_TCR:
++	case ARM_SMMU_CB_S1_MAIR0:
++	case ARM_SMMU_CB_S1_MAIR1:
++	case ARM_SMMU_CB_S1_TLBIVA:
++	case ARM_SMMU_CB_S1_TLBIASID:
++	case ARM_SMMU_CB_S1_TLBIVAL:
++	case ARM_SMMU_CB_TLBSYNC:
++		return write;
++	case ARM_SMMU_CB_FSR:
++		return true;
++	case ARM_SMMU_CB_FAR:
++	case ARM_SMMU_CB_FSYNR0:
++	case ARM_SMMU_CB_TLBSTATUS:
++		return !write;
++	}
++	return false;
++}
++
++bool arm_smmu_inherit_access_ok(struct arm_smmu_device *smmu, int page,
++				int offset, bool write, u64 val)
++{
++	unsigned int n, ngroups = smmu->num_mapping_groups;
++	bool ok = false;
++
++	if (offset & 3) {
++		ok = false;
++	} else if (page == ARM_SMMU_GR0) {
++		if (offset >= ARM_SMMU_GR0_SMR(0) &&
++		    offset < ARM_SMMU_GR0_SMR(ngroups)) {
++			n = (offset - ARM_SMMU_GR0_SMR(0)) >> 2;
++			ok = !write || (smmu->inherit_attach &&
++					arm_smmu_inherit_smr_write_ok(smmu, n, val));
++		} else if (offset >= ARM_SMMU_GR0_S2CR(0) &&
++			   offset < ARM_SMMU_GR0_S2CR(ngroups)) {
++			n = (offset - ARM_SMMU_GR0_S2CR(0)) >> 2;
++			if (write)
++				ok = smmu->inherit_attach &&
++				     arm_smmu_inherit_s2cr_write_ok(smmu, n, val);
++			else
++				ok = smmu->smrs[n].valid;
++		} else if (!write) {
++			ok = offset == ARM_SMMU_GR0_ID0 ||
++			     offset == ARM_SMMU_GR0_ID1 ||
++			     (offset == ARM_SMMU_GR0_ID2 && smmu->inherit_attach);
++		}
++	} else if (page == ARM_SMMU_GR1) {
++		/* CBAR(n) at 0x0, CBFRSYNRA(n) at 0x400, CBA2R(n) at 0x800 */
++		n = (offset & 0x3ff) >> 2;
++		if (offset < ARM_SMMU_GR1_CBFRSYNRA(0) ||
++		    (offset >= ARM_SMMU_GR1_CBA2R(0) &&
++		     offset < ARM_SMMU_GR1_CBA2R(0) + 0x400))
++			ok = write;
++		else if (offset < ARM_SMMU_GR1_CBA2R(0))
++			ok = !write;
++		ok = ok && smmu->inherit_attach &&
++		     arm_smmu_inherit_cb_owned(smmu, n);
++	} else if (smmu->num_context_banks && page >= smmu->numpage &&
++		   page < smmu->numpage + smmu->num_context_banks) {
++		n = page - smmu->numpage;
++		ok = smmu->inherit_attach && arm_smmu_inherit_cb_owned(smmu, n) &&
++		     arm_smmu_inherit_cb_reg_ok(offset, write);
++	}
++
++	if (ok) {
++		if (write)
++			atomic_inc(&smmu->inherit_writes);
++		return true;
++	}
++
++	atomic_inc(&smmu->inherit_refused);
++	if (write && page == ARM_SMMU_GR0 && offset == ARM_SMMU_GR0_sCR0)
++		dev_WARN(smmu->dev, "inherit: refused sCR0 write %#llx\n", val);
++	else
++		dev_WARN_ONCE(smmu->dev, true,
++			      "inherit: refused %s page %d offset %#x val %#llx\n",
++			      write ? "write" : "read", page, offset, val);
++	dev_err_ratelimited(smmu->dev,
++			    "inherit: refused %s page %d offset %#x val %#llx\n",
++			    write ? "write" : "read", page, offset, val);
++	return false;
++}
++
++static int arm_smmu_inherit_dt_probe(struct arm_smmu_device *smmu)
++{
++	struct device *dev = smmu->dev;
++	const char *prop = "oculus,inherit-attach-sids";
++	int i, n, err;
++
++	smmu->inherit = true;
++
++	/*
++	 * No power domain and no clocks, so runtime PM (whose resume would
++	 * reset the SMMU) stays off. Refuse before any clock is enabled.
++	 */
++	if (dev->pm_domain || of_property_present(dev->of_node, "clocks") ||
++	    of_property_present(dev->of_node, "power-domains"))
++		return dev_err_probe(dev, -ENODEV,
++				     "inherit: power domain or clocks, not probing\n");
++
++	n = of_property_count_u32_elems(dev->of_node, prop);
++	if (n == -EINVAL)
++		n = 0;
++	else if (n <= 0 || n > 16)
++		return dev_err_probe(dev, -EINVAL, "inherit: bad %s\n", prop);
++
++	if (n) {
++		smmu->inherit_sids = devm_kcalloc(dev, n, sizeof(u32), GFP_KERNEL);
++		if (!smmu->inherit_sids)
++			return -ENOMEM;
++		err = of_property_read_u32_array(dev->of_node, prop,
++						 smmu->inherit_sids, n);
++		if (err)
++			return dev_err_probe(dev, err, "inherit: bad %s\n", prop);
++		for (i = 0; i < n; i++) {
++			if (smmu->inherit_sids[i] > 0x7fff)
++				return dev_err_probe(dev, -EINVAL,
++						     "inherit: bad stream ID %#x\n",
++						     smmu->inherit_sids[i]);
++			dev_info(dev, "inherit: stream ID %#x may attach\n",
++				 smmu->inherit_sids[i]);
++		}
++	}
++	smmu->num_inherit_sids = n;
++	smmu->inherit_attach = n > 0;
++	dev_info(dev, "inherit mode: no reset, %d attachable stream ID(s)\n", n);
++	return 0;
++}
++
++/*
++ * Inherit mode: geometry from ID0/ID1 (and ID2 if masters may attach), then the
++ * stream map. Valid entries are pinned and marked inherited, and the banks
++ * TRANS entries point at are reserved in context_map.
++ */
++static int arm_smmu_inherit_cfg_probe(struct arm_smmu_device *smmu)
++{
++	struct device *dev = smmu->dev;
++	unsigned int i, size, cbndx, nvalid = 0, nother = 0;
++	u32 id0, id1, id2, smr, s2cr, type;
++
++	id0 = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_ID0);
++	id1 = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_ID1);
++	dev_info(dev, "inherit: ID0=%#010x ID1=%#010x\n", id0, id1);
++
++	/*
++	 * Legacy (non-EXIDS) SMR layout only: with EXIDS the layout would
++	 * depend on sCR0.EXIDENABLE, which this mode never reads.
++	 */
++	if (smmu->version != ARM_SMMU_V2 || !(id0 & ARM_SMMU_ID0_S1TS) ||
++	    !(id0 & ARM_SMMU_ID0_SMS) || (id0 & ARM_SMMU_ID0_EXIDS) ||
++	    (id1 & ARM_SMMU_ID1_PAGESIZE))
++		return dev_err_probe(dev, -ENODEV,
++				     "inherit: unexpected ID0/ID1, not probing\n");
++
++	smmu->features |= ARM_SMMU_FEAT_TRANS_S1 | ARM_SMMU_FEAT_STREAM_MATCH;
++	smmu->streamid_mask = (1 << FIELD_GET(ARM_SMMU_ID0_NUMSIDB, id0)) - 1;
++	/* arm_smmu_test_smr_masks() writes an SMR; take the ID width instead */
++	smmu->smr_mask_mask = smmu->streamid_mask;
++
++	size = FIELD_GET(ARM_SMMU_ID0_NUMSMRG, id0);
++	if (!size || size > ARM_SMMU_INHERIT_MAX_SMES)
++		return dev_err_probe(dev, -ENODEV,
++				     "inherit: %u stream map groups, not probing\n",
++				     size);
++	smmu->smrs = devm_kcalloc(dev, size, sizeof(*smmu->smrs), GFP_KERNEL);
++	smmu->s2crs = devm_kcalloc(dev, size, sizeof(*smmu->s2crs), GFP_KERNEL);
++	if (!smmu->smrs || !smmu->s2crs)
++		return -ENOMEM;
++	for (i = 0; i < size; i++)
++		smmu->s2crs[i] = s2cr_init_val;
++	mutex_init(&smmu->stream_map_mutex);
++	spin_lock_init(&smmu->global_sync_lock);
++
++	smmu->pgshift = 12;
++	size = 1 << (FIELD_GET(ARM_SMMU_ID1_NUMPAGENDXB, id1) + 1);
++	if (smmu->numpage != 2 * size << smmu->pgshift)
++		return dev_err_probe(dev, -ENODEV,
++				     "inherit: SMMU size %#x differs from region %#x, not probing\n",
++				     2 * size << smmu->pgshift, smmu->numpage);
++	smmu->numpage = size;
++
++	smmu->num_s2_context_banks = FIELD_GET(ARM_SMMU_ID1_NUMS2CB, id1);
++	size = FIELD_GET(ARM_SMMU_ID1_NUMCB, id1);
++	if (!size || size > ARM_SMMU_MAX_CBS ||
++	    smmu->num_s2_context_banks > size ||
++	    size > smmu->num_context_irqs)
++		return dev_err_probe(dev, -ENODEV,
++				     "inherit: %u context banks, not probing\n",
++				     size);
++	smmu->num_context_banks = size;
++	smmu->cbs = devm_kcalloc(dev, size, sizeof(*smmu->cbs), GFP_KERNEL);
++	if (!smmu->cbs)
++		return -ENOMEM;
++
++	if (smmu->inherit_attach) {
++		id2 = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_ID2);
++		dev_info(dev, "inherit: ID2=%#010x\n", id2);
++		if (!(id2 & ARM_SMMU_ID2_PTFS_4K))
++			return dev_err_probe(dev, -ENODEV,
++					     "inherit: no AArch64 4K tables, not probing\n");
++		smmu->ipa_size = arm_smmu_id_size_to_bits(FIELD_GET(ARM_SMMU_ID2_IAS, id2));
++		smmu->pa_size = arm_smmu_id_size_to_bits(FIELD_GET(ARM_SMMU_ID2_OAS, id2));
++		smmu->va_size = arm_smmu_id_size_to_bits(FIELD_GET(ARM_SMMU_ID2_UBS, id2));
++		/* only the format the previous OS used here: AArch64 4K */
++		smmu->features |= ARM_SMMU_FEAT_FMT_AARCH64_4K;
++		smmu->pgsize_bitmap = SZ_4K | SZ_2M | SZ_1G;
++		if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(smmu->pa_size)))
++			dev_warn(dev, "failed to set DMA mask for table walker\n");
++	}
++
++	/* Seed the stream map and the bank allocator from the hardware */
++	smmu->num_mapping_groups = FIELD_GET(ARM_SMMU_ID0_NUMSMRG, id0);
++	for (i = 0; i < smmu->num_mapping_groups; i++) {
++		smr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_SMR(i));
++		if (!(smr & ARM_SMMU_SMR_VALID))
++			continue;
++
++		smr &= ~ARM_SMMU_SMR_VALID;
++		smmu->smrs[i].id = FIELD_GET(ARM_SMMU_SMR_ID, smr);
++		smmu->smrs[i].mask = FIELD_GET(ARM_SMMU_SMR_MASK, smr);
++		smmu->smrs[i].valid = true;
++		smmu->smrs[i].pinned = true;
++		set_bit(i, smmu->inherit_smes);
++		nvalid++;
++
++		s2cr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_S2CR(i));
++		type = FIELD_GET(ARM_SMMU_S2CR_TYPE, s2cr);
++		cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, s2cr);
++		smmu->s2crs[i].type = type;
++		smmu->s2crs[i].privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, s2cr);
++		smmu->s2crs[i].cbndx = cbndx;
++		smmu->s2crs[i].count = 1;
++
++		if (type != S2CR_TYPE_TRANS) {
++			nother++;
++			continue;
++		}
++		if (cbndx >= smmu->num_context_banks)
++			return dev_err_probe(dev, -ENODEV,
++					     "inherit: SME %u points at CB%u of %u, not probing\n",
++					     i, cbndx, smmu->num_context_banks);
++		set_bit(cbndx, smmu->context_map);
++		set_bit(cbndx, smmu->inherit_cbs);
++	}
++
++	dev_info(dev, "inherit: %u valid SMEs (%u not TRANS) of %u, %u CBs in use of %u: %*pbl\n",
++		 nvalid, nother, smmu->num_mapping_groups,
++		 bitmap_weight(smmu->inherit_cbs, ARM_SMMU_MAX_CBS),
++		 smmu->num_context_banks, smmu->num_context_banks,
++		 smmu->inherit_cbs);
++	return 0;
++}
++
++/*
++ * Read-only dump of the stream map and of the context banks in use, logged at
++ * probe and after each attach. These raw reads bypass
++ * arm_smmu_inherit_access_ok() and are the only reads of inherited banks.
++ * Returns how many inherited banks use an ASID at or above
++ * ARM_SMMU_INHERIT_ASID_BASE.
++ */
++static int arm_smmu_inherit_dump(struct arm_smmu_device *smmu, const char *tag)
++{
++	static const char * const types[] = { "TRANS", "BYPASS", "FAULT", "?" };
++	void __iomem *gr0 = smmu->base;
++	void __iomem *gr1 = smmu->base + (1UL << smmu->pgshift);
++	DECLARE_BITMAP(seen, ARM_SMMU_MAX_CBS);
++	DECLARE_BITMAP(cbs, ARM_SMMU_MAX_CBS);
++	u32 id0, id1, numsmrg, numcb, i, nvalid = 0, nloose;
++	int clash = 0;
++
++	bitmap_zero(seen, ARM_SMMU_MAX_CBS);
++	id0 = readl_relaxed(gr0 + ARM_SMMU_GR0_ID0);
++	id1 = readl_relaxed(gr0 + ARM_SMMU_GR0_ID1);
++	numsmrg = min_t(u32, FIELD_GET(ARM_SMMU_ID0_NUMSMRG, id0),
++			smmu->num_mapping_groups);
++	numcb = min_t(u32, FIELD_GET(ARM_SMMU_ID1_NUMCB, id1),
++		      smmu->num_context_banks);
++
++	dev_info(smmu->dev,
++		 "q2_smmudump: apps_smmu@%#llx ID0=%#010x ID1=%#010x numsmrg=%u numcb=%u pgshift=%u (%s) READ-ONLY dump begin\n",
++		 (u64)smmu->ioaddr, id0, id1, numsmrg, numcb, smmu->pgshift,
++		 tag);
++
++	for (i = 0; i < numsmrg; i++) {
++		u32 smr = readl_relaxed(gr0 + ARM_SMMU_GR0_SMR(i));
++		u32 s2cr, type, cbndx;
++
++		if (!(smr & ARM_SMMU_SMR_VALID))
++			continue;
++		nvalid++;
++		s2cr = readl_relaxed(gr0 + ARM_SMMU_GR0_S2CR(i));
++		type = FIELD_GET(ARM_SMMU_S2CR_TYPE, s2cr);
++		cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, s2cr);
++		dev_info(smmu->dev,
++			 "q2_smmudump: SMR[%3u] id=%#06x mask=%#06x -> S2CR=%#010x type=%s cbndx=%u\n",
++			 i, smr & 0x7fff, (smr >> 16) & 0x7fff, s2cr,
++			 types[type], cbndx);
++		if (type == S2CR_TYPE_TRANS && cbndx < numcb)
++			set_bit(cbndx, seen);
++	}
++
++	bitmap_or(cbs, seen, smmu->inherit_cbs, ARM_SMMU_MAX_CBS);
++	nloose = bitmap_weight(cbs, numcb) - bitmap_weight(seen, numcb);
++	for_each_set_bit(i, cbs, numcb) {
++		void __iomem *cb = smmu->base +
++			((unsigned long)(smmu->numpage + i) << smmu->pgshift);
++		u32 cbar, cba2r, sctlr, lo, hi, ttbcr, contextidr, fsr, fsynr0;
++		const char *note;
++		u64 ttbr0;
++
++		cbar = readl_relaxed(gr1 + ARM_SMMU_GR1_CBAR(i));
++		cba2r = readl_relaxed(gr1 + ARM_SMMU_GR1_CBA2R(i));
++		sctlr = readl_relaxed(cb + ARM_SMMU_CB_SCTLR);
++		lo = readl_relaxed(cb + ARM_SMMU_CB_TTBR0);
++		hi = readl_relaxed(cb + ARM_SMMU_CB_TTBR0 + 4);
++		ttbcr = readl_relaxed(cb + ARM_SMMU_CB_TCR);
++		contextidr = readl_relaxed(cb + ARM_SMMU_CB_CONTEXTIDR);
++		fsr = readl_relaxed(cb + ARM_SMMU_CB_FSR);
++		fsynr0 = readl_relaxed(cb + ARM_SMMU_CB_FSYNR0);
++		ttbr0 = (u64)hi << 32 | lo;
++
++		if (test_bit(i, smmu->inherit_cbs) &&
++		    FIELD_GET(ARM_SMMU_TTBRn_ASID, ttbr0) >= ARM_SMMU_INHERIT_ASID_BASE)
++			clash++;
++
++		/* a bank that reads as zero from the non-secure side is flagged */
++		if (!cbar && !sctlr && !ttbr0)
++			note = "  <== SECURE? (RAZ from NS)";
++		else if (sctlr & ARM_SMMU_SCTLR_M)
++			note = "  (translating, M=1)";
++		else
++			note = "  (identity/bypass, M=0)";
++
++		dev_info(smmu->dev,
++			 "q2_smmudump: CB[%3u] CBAR=%#010x(type=%u vmid=%#x) CBA2R=%#010x SCTLR=%#010x TTBR0=%#018llx TTBCR=%#010x CONTEXTIDR=%#010x FSR=%#010x FSYNR0=%#010x%s\n",
++			 i, cbar, (u32)FIELD_GET(ARM_SMMU_CBAR_TYPE, cbar),
++			 (u32)FIELD_GET(ARM_SMMU_CBAR_VMID, cbar), cba2r, sctlr,
++			 ttbr0, ttbcr, contextidr, fsr, fsynr0, note);
++	}
++
++	if (nloose)
++		dev_info(smmu->dev,
++			 "q2_smmudump: %u inherited CB(s) no SMR points at\n",
++			 nloose);
++	dev_info(smmu->dev,
++		 "q2_smmudump: dump end - %u valid SMRs, %u referenced CBs. NO writes performed.\n",
++		 nvalid, (u32)bitmap_weight(seen, ARM_SMMU_MAX_CBS));
++	return clash;
++}
++
++static int arm_smmu_inherit_probe(struct platform_device *pdev,
++				  struct arm_smmu_device *smmu)
++{
++	struct device *dev = &pdev->dev;
++	int err, clash;
++
++	/*
++	 * Check again what the generic probe found, and refuse the legacy
++	 * binding.
++	 */
++	if (dev->pm_domain || smmu->num_clks || using_legacy_binding)
++		return dev_err_probe(dev, -ENODEV,
++				     "inherit: power domain, clocks or legacy binding, not probing\n");
++
++	err = arm_smmu_inherit_cfg_probe(smmu);
++	if (err)
++		return err;
++
++	clash = arm_smmu_inherit_dump(smmu, "probe");
++	if (clash && smmu->inherit_attach) {
++		dev_err(dev, "inherit: %d inherited CBs use ASIDs >= %#x, masters may not attach\n",
++			clash, ARM_SMMU_INHERIT_ASID_BASE);
++		smmu->inherit_attach = false;
++	}
++
++	/* Context IRQs are requested per attached domain only */
++	smmu->num_context_irqs = smmu->num_context_banks;
++
++	/*
++	 * No global fault IRQ: its handler clears sGFSR. Global faults stay
++	 * masked, as before this driver bound.
++	 */
++	platform_set_drvdata(pdev, smmu);
++
++	err = iommu_device_sysfs_add(&smmu->iommu, dev, NULL,
++				     "smmu.%pa", &smmu->ioaddr);
++	if (err)
++		return dev_err_probe(dev, err, "Failed to register iommu in sysfs\n");
++
++	err = iommu_device_register(&smmu->iommu, &arm_smmu_ops, dev);
++	if (err) {
++		iommu_device_sysfs_remove(&smmu->iommu);
++		return dev_err_probe(dev, err, "Failed to register iommu\n");
++	}
++
++	dev_info(dev, "inherit: probed, %d register writes, %d refused, masters %s\n",
++		 atomic_read(&smmu->inherit_writes),
++		 atomic_read(&smmu->inherit_refused),
++		 smmu->inherit_attach ? "may attach" : "may not attach");
++	return 0;
++}
++
+ struct arm_smmu_match_data {
+ 	enum arm_smmu_arch_version version;
+ 	enum arm_smmu_implementation model;
++	bool inherit;
+ };
+ 
+ #define ARM_SMMU_MATCH_DATA(name, ver, imp)	\
+@@ -1951,6 +2554,14 @@ ARM_SMMU_MATCH_DATA(arm_mmu500, ARM_SMMU_V2, ARM_MMU500);
+ ARM_SMMU_MATCH_DATA(cavium_smmuv2, ARM_SMMU_V2, CAVIUM_SMMUV2);
+ ARM_SMMU_MATCH_DATA(qcom_smmuv2, ARM_SMMU_V2, QCOM_SMMUV2);
+ 
++/*
++ * A compatible of its own, so that a kernel without inherit mode never binds
++ * and resets this SMMU.
++ */
++static const struct arm_smmu_match_data quest2_apps_smmu_inherit = {
++	.version = ARM_SMMU_V2, .model = ARM_MMU500, .inherit = true,
++};
++
+ static const struct of_device_id arm_smmu_of_match[] = {
+ 	{ .compatible = "arm,smmu-v1", .data = &smmu_generic_v1 },
+ 	{ .compatible = "arm,smmu-v2", .data = &smmu_generic_v2 },
+@@ -1960,6 +2571,8 @@ static const struct of_device_id arm_smmu_of_match[] = {
+ 	{ .compatible = "cavium,smmu-v2", .data = &cavium_smmuv2 },
+ 	{ .compatible = "nvidia,smmu-500", .data = &arm_mmu500 },
+ 	{ .compatible = "qcom,smmu-v2", .data = &qcom_smmuv2 },
++	{ .compatible = "oculus,hollywood-apps-smmu-inherit",
++	  .data = &quest2_apps_smmu_inherit },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, arm_smmu_of_match);
+@@ -2046,6 +2659,12 @@ static int arm_smmu_device_dt_probe(struct arm_smmu_device *smmu,
+ 	data = of_device_get_match_data(dev);
+ 	smmu->version = data->version;
+ 	smmu->model = data->model;
++	if (data->inherit) {
++		int err = arm_smmu_inherit_dt_probe(smmu);
++
++		if (err)
++			return err;
++	}
+ 
+ 	legacy_binding = of_find_property(dev->of_node, "mmu-masters", NULL);
+ 	if (legacy_binding && !using_generic_binding) {
+@@ -2077,6 +2696,10 @@ static void arm_smmu_rmr_install_bypass_smr(struct arm_smmu_device *smmu)
+ 	INIT_LIST_HEAD(&rmr_list);
+ 	iort_get_rmr_sids(dev_fwnode(smmu->dev), &rmr_list);
+ 
++	/* Inherit mode: never reached; would write sCR0.CLIENTPD */
++	if (WARN_ON(smmu->inherit))
++		return;
++
+ 	/*
+ 	 * Rather than trying to look at existing mappings that
+ 	 * are setup by the firmware and then invalidate the ones
+@@ -2186,6 +2809,10 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
+ 	if (err)
+ 		return err;
+ 
++	/* Inherit mode: own probe, without test writes or reset */
++	if (smmu->inherit)
++		return arm_smmu_inherit_probe(pdev, smmu);
++
+ 	err = arm_smmu_device_cfg_probe(smmu);
+ 	if (err)
+ 		return err;
+@@ -2260,6 +2887,12 @@ static void arm_smmu_device_shutdown(struct platform_device *pdev)
+ {
+ 	struct arm_smmu_device *smmu = platform_get_drvdata(pdev);
+ 
++	/* Inherit mode: leave sCR0 and every bank as they are (kexec, reboot) */
++	if (smmu->inherit) {
++		dev_info(&pdev->dev, "inherit: shutdown leaves the SMMU as it is\n");
++		return;
++	}
++
+ 	if (!bitmap_empty(smmu->context_map, ARM_SMMU_MAX_CBS))
+ 		dev_notice(&pdev->dev, "disabling translation\n");
+ 
+@@ -2295,7 +2928,9 @@ static int __maybe_unused arm_smmu_runtime_resume(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	arm_smmu_device_reset(smmu);
++	/* Inherit mode has no runtime PM; a resume must not reset */
++	if (!smmu->inherit)
++		arm_smmu_device_reset(smmu);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu.h b/drivers/iommu/arm/arm-smmu/arm-smmu.h
+index 26d2e33cd..f832ad2d2 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.h
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.h
+@@ -253,6 +253,10 @@ enum arm_smmu_cbar_type {
+ 
+ /* Maximum number of context banks per SMMU */
+ #define ARM_SMMU_MAX_CBS		128
++/* Inherit mode: stream map groups it can track (ID0.NUMSMRG upper bound) */
++#define ARM_SMMU_INHERIT_MAX_SMES	128
++/* Inherit mode: stage-1 ASIDs above every ASID the previous OS used */
++#define ARM_SMMU_INHERIT_ASID_BASE	0xf000
+ 
+ #define TLB_LOOP_TIMEOUT		1000000	/* 1s! */
+ #define TLB_SPIN_COUNT			10
+@@ -340,6 +344,20 @@ struct arm_smmu_device {
+ 
+ 	/* IOMMU core code handle */
+ 	struct iommu_device		iommu;
++
++	/*
++	 * Inherit mode ("oculus,hollywood-apps-smmu-inherit"): the stream map
++	 * and banks the previous OS set up are kept, see arm-smmu.c
++	 */
++	bool				inherit;
++	/* Masters may attach (non-empty oculus,inherit-attach-sids) */
++	bool				inherit_attach;
++	DECLARE_BITMAP(inherit_cbs, ARM_SMMU_MAX_CBS);
++	DECLARE_BITMAP(inherit_smes, ARM_SMMU_INHERIT_MAX_SMES);
++	u32				*inherit_sids;
++	int				num_inherit_sids;
++	atomic_t			inherit_writes;
++	atomic_t			inherit_refused;
+ };
+ 
+ enum arm_smmu_context_fmt {
+@@ -481,8 +499,14 @@ static inline void __iomem *arm_smmu_page(struct arm_smmu_device *smmu, int n)
+ 	return smmu->base + (n << smmu->pgshift);
+ }
+ 
++bool arm_smmu_inherit_access_ok(struct arm_smmu_device *smmu, int page,
++				int offset, bool write, u64 val);
++
+ static inline u32 arm_smmu_readl(struct arm_smmu_device *smmu, int page, int offset)
+ {
++	if (unlikely(smmu->inherit) &&
++	    !arm_smmu_inherit_access_ok(smmu, page, offset, false, 0))
++		return 0;
+ 	if (smmu->impl && unlikely(smmu->impl->read_reg))
+ 		return smmu->impl->read_reg(smmu, page, offset);
+ 	return readl_relaxed(arm_smmu_page(smmu, page) + offset);
+@@ -491,6 +515,9 @@ static inline u32 arm_smmu_readl(struct arm_smmu_device *smmu, int page, int off
+ static inline void arm_smmu_writel(struct arm_smmu_device *smmu, int page,
+ 				   int offset, u32 val)
+ {
++	if (unlikely(smmu->inherit) &&
++	    !arm_smmu_inherit_access_ok(smmu, page, offset, true, val))
++		return;
+ 	if (smmu->impl && unlikely(smmu->impl->write_reg))
+ 		smmu->impl->write_reg(smmu, page, offset, val);
+ 	else
+@@ -499,6 +526,9 @@ static inline void arm_smmu_writel(struct arm_smmu_device *smmu, int page,
+ 
+ static inline u64 arm_smmu_readq(struct arm_smmu_device *smmu, int page, int offset)
+ {
++	if (unlikely(smmu->inherit) &&
++	    !arm_smmu_inherit_access_ok(smmu, page, offset, false, 0))
++		return 0;
+ 	if (smmu->impl && unlikely(smmu->impl->read_reg64))
+ 		return smmu->impl->read_reg64(smmu, page, offset);
+ 	return readq_relaxed(arm_smmu_page(smmu, page) + offset);
+@@ -507,6 +537,9 @@ static inline u64 arm_smmu_readq(struct arm_smmu_device *smmu, int page, int off
+ static inline void arm_smmu_writeq(struct arm_smmu_device *smmu, int page,
+ 				   int offset, u64 val)
+ {
++	if (unlikely(smmu->inherit) &&
++	    !arm_smmu_inherit_access_ok(smmu, page, offset, true, val))
++		return;
+ 	if (smmu->impl && unlikely(smmu->impl->write_reg64))
+ 		smmu->impl->write_reg64(smmu, page, offset, val);
+ 	else

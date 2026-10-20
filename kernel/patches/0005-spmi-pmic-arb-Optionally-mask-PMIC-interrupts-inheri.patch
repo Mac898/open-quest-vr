@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 05/16] spmi: pmic-arb: Optionally mask PMIC interrupts
+ inherited across kexec
+
+After kexec the previous kernel may have left PMIC interrupts enabled
+in this EE's accumulators for peripherals no driver here handles.
+pmic_arb_chained_irq() finds no mapping and only clears the latch, so
+a level-triggered source fires again at once and livelocks the CPU.
+
+Add SPMI_MSM_PMIC_ARB_MASK_INHERITED_IRQS: at bus init, before the
+chained handler is installed, clear ACC_ENABLE for every APID owned by
+this EE. qpnpint_irq_unmask() sets it again for each interrupt a driver
+requests. Only arbiter registers are written.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ drivers/spmi/Kconfig         | 11 ++++++++++
+ drivers/spmi/spmi-pmic-arb.c | 40 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/drivers/spmi/Kconfig b/drivers/spmi/Kconfig
+index a80cf4047..d0f705708 100644
+--- a/drivers/spmi/Kconfig
++++ b/drivers/spmi/Kconfig
+@@ -43,6 +43,17 @@ config SPMI_MSM_PMIC_ARB
+ 	  This is required for communicating with Qualcomm PMICs and
+ 	  other devices that have the SPMI interface.
+ 
++config SPMI_MSM_PMIC_ARB_MASK_INHERITED_IRQS
++	bool "Mask PMIC interrupts inherited from a previous kernel"
++	depends on SPMI_MSM_PMIC_ARB
++	help
++	  At probe, clear the arbiter accumulator enable of every peripheral
++	  interrupt routed to this EE, so interrupts a previous kernel left
++	  enabled (kexec warm handoff) cannot storm before their driver
++	  requests them. Only arbiter registers are written.
++
++	  If unsure, say N.
++
+ config SPMI_MTK_PMIF
+ 	tristate "Mediatek SPMI Controller (PMIC Arbiter)"
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
+diff --git a/drivers/spmi/spmi-pmic-arb.c b/drivers/spmi/spmi-pmic-arb.c
+index 91581974e..582eb6d06 100644
+--- a/drivers/spmi/spmi-pmic-arb.c
++++ b/drivers/spmi/spmi-pmic-arb.c
+@@ -1661,6 +1661,44 @@ static const struct irq_domain_ops pmic_arb_irq_domain_ops = {
+ 	.translate = qpnpint_irq_domain_translate,
+ };
+ 
++/*
++ * After kexec, the previous kernel may have left PMIC interrupts enabled for
++ * peripherals no driver here handles. The chained handler finds no mapping and
++ * only clears the latch, so a level source fires forever. Clear ACC_ENABLE of
++ * every APID owned by this EE before the handler is installed;
++ * qpnpint_irq_unmask() sets it again for each requested IRQ.
++ */
++static void pmic_arb_mask_inherited_irqs(struct spmi_pmic_arb_bus *bus)
++{
++	struct spmi_pmic_arb *pmic_arb = bus->pmic_arb;
++	unsigned int apid, n = 0;
++	void __iomem *reg;
++	u16 ppid, map;
++
++	if (!IS_ENABLED(CONFIG_SPMI_MSM_PMIC_ARB_MASK_INHERITED_IRQS) ||
++	    !bus->apid_count)
++		return;
++
++	for (apid = bus->base_apid; apid <= bus->last_apid; apid++) {
++		ppid = bus->apid_data[apid].ppid;
++		map = bus->ppid_to_apid[ppid];
++		if (!(map & PMIC_ARB_APID_VALID) ||
++		    (map & ~PMIC_ARB_APID_VALID) != apid ||
++		    bus->apid_data[apid].irq_ee != pmic_arb->ee)
++			continue;
++
++		reg = pmic_arb->ver_ops->acc_enable(bus, apid);
++		if (readl_relaxed(reg) & SPMI_PIC_ACC_ENABLE_BIT) {
++			writel_relaxed(0, reg);
++			n++;
++		}
++	}
++
++	if (n)
++		dev_info(&bus->spmic->dev,
++			 "masked %u inherited PMIC interrupt sources\n", n);
++}
++
+ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
+ 				  struct device_node *node,
+ 				  struct spmi_pmic_arb *pmic_arb)
+@@ -1735,6 +1773,8 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
+ 	if (ret)
+ 		return ret;
+ 
++	pmic_arb_mask_inherited_irqs(bus);
++
+ 	dev_dbg(&pdev->dev, "adding irq domain for bus %d\n", bus_index);
+ 
+ 	bus->domain = irq_domain_create_tree(of_fwnode_handle(node), &pmic_arb_irq_domain_ops, bus);

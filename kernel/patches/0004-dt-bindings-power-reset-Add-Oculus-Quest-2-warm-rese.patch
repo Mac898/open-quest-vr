@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 04/16] dt-bindings: power: reset: Add Oculus Quest 2 warm
+ reset
+
+Describe the DRAM-preserving warm reset of the Oculus Quest 2: the
+PM8150 PON PS_HOLD reset type is set to warm reset over SPMI, then the
+MPM PS_HOLD line is dropped directly, with the APSS watchdog re-armed as
+a backstop. The node points at the PON peripheral and the watchdog it
+uses.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ .../reset/oculus,hollywood-warm-reset.yaml    | 54 +++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/power/reset/oculus,hollywood-warm-reset.yaml
+
+diff --git a/Documentation/devicetree/bindings/power/reset/oculus,hollywood-warm-reset.yaml b/Documentation/devicetree/bindings/power/reset/oculus,hollywood-warm-reset.yaml
+new file mode 100644
+index 000000000..f4e6feabb
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/reset/oculus,hollywood-warm-reset.yaml
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/power/reset/oculus,hollywood-warm-reset.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Oculus Quest 2 PS_HOLD warm reset
++
++maintainers:
++  - mac <xmachd@gmail.com>
++
++description:
++  DRAM-preserving warm reset of the Oculus Quest 2 ("hollywood"). The PM8150
++  PON PS_HOLD reset type is set to warm reset over SPMI and the MPM PS_HOLD
++  line is then dropped directly, with the APSS watchdog re-armed with a short
++  bite as a backstop. The reset is requested from userspace or, optionally,
++  when panic() restarts the system.
++
++properties:
++  compatible:
++    const: oculus,hollywood-warm-reset
++
++  reg:
++    maxItems: 1
++    description: MPM PS_HOLD register.
++
++  oculus,pon:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      PON peripheral of the system-reset PMIC (PM8150 at SPMI USID 0, PON
++      at 0x800). Only its PS_HOLD reset control registers are written.
++
++  oculus,apss-wdt:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      APSS watchdog (qcom,kpss-wdt), re-armed with a short bite before the
++      PS_HOLD drop.
++
++required:
++  - compatible
++  - reg
++  - oculus,pon
++  - oculus,apss-wdt
++
++additionalProperties: false
++
++examples:
++  - |
++    warm-reset@c264000 {
++        compatible = "oculus,hollywood-warm-reset";
++        reg = <0x0c264000 0x4>;
++        oculus,pon = <&pon>;
++        oculus,apss-wdt = <&watchdog>;
++    };

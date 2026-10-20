@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Stage-2 rootfs package set (Alpine stable branch, aarch64; see build.sh). One package per line.
+# After install, build-in-container.sh strips every tool that can write hardware
+# state (mkfs/partition/flash, i2cset, setpci, serial, watchdog, fbset ...): see STRIP.
+alpine-baselayout
+alpine-keys
+alpine-release
+apk-tools
+busybox
+musl-utils
+coreutils
+python3
+strace
+evtest
+i2c-tools
+usbutils
+pciutils
+iproute2
+tcpdump
+file
+xxd
+dtc
+dropbear
+# util-linux, picked per subpackage: the `util-linux` meta pulls in sfdisk,
+# cfdisk, wipefs, partx and losetup, which we don't want on the headset.
+util-linux-misc
+dmesg
+lsblk
+findmnt
+setpriv
+# GPU, headless: Mesa Turnip Vulkan ICD + loader, vulkaninfo, a read-only DRM node dump.
+# mesa-vulkan-freedreno pulls mesa (and libLLVM). The branch is pinned (vX.Y): the exact package versions of
+# a build are listed in out/<name>.manifest.txt.
+# /usr/local/bin/vk-compute-smoke (rootfs/vkcompute, built by build-in-container.sh) is the compute check.
+mesa-vulkan-freedreno
+vulkan-loader
+vulkan-tools
+drm_info

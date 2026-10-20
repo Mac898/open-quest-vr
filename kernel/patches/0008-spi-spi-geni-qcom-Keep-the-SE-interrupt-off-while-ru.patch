@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 08/16] spi: spi-geni-qcom: Keep the SE interrupt off while
+ runtime suspended
+
+The SE interrupt stays enabled while runtime PM has the SE clocks off,
+and the handler reads SE registers unconditionally. After a kexec the
+previous owner may also have left status pending that the handler never
+acks.
+
+Enable the interrupt only while runtime active, as i2c-qcom-geni does,
+and keep it off until spi_geni_init() has run. The handler returns
+IRQ_NONE when the device is suspended and acks secondary-sequencer and
+SE DMA status in every mode but GPI. spi_geni_init() logs the pending
+status it finds before clearing it.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ drivers/spi/spi-geni-qcom.c | 95 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/spi/spi-geni-qcom.c b/drivers/spi/spi-geni-qcom.c
+index ec40fcb10..9270d7c97 100644
+--- a/drivers/spi/spi-geni-qcom.c
++++ b/drivers/spi/spi-geni-qcom.c
+@@ -75,6 +75,11 @@
+ #define GSI_CPHA		BIT(4)
+ #define GSI_CPOL		BIT(5)
+ 
++/* SE interrupt enables, as in qcom-geni-se.c; read only, for the probe log */
++#define SE_DMA_TX_IRQ_EN	0xc48
++#define SE_DMA_RX_IRQ_EN	0xd48
++#define SE_IRQ_EN		0xe1c
++
+ struct spi_geni_master {
+ 	struct geni_se se;
+ 	struct device *dev;
+@@ -649,6 +654,28 @@ static int spi_geni_grab_gpi_chan(struct spi_geni_master *mas)
+ 	return ret;
+ }
+ 
++/*
++ * Log, read only, what the previous owner of the SE (bootloader, or an OS
++ * before kexec) left pending, before geni_se_init() clears it.
++ */
++static void spi_geni_log_irq_state(struct spi_geni_master *mas)
++{
++	void __iomem *base = mas->se.base;
++
++	dev_info(mas->dev,
++		 "pre-init IRQ state: if_disable %#x se_irq_en %#x m_en %#010x m_status %#010x s_en %#010x s_status %#010x dma_tx en %#x status %#x dma_rx en %#x status %#x\n",
++		 readl_relaxed(base + GENI_IF_DISABLE_RO),
++		 readl_relaxed(base + SE_IRQ_EN),
++		 readl_relaxed(base + SE_GENI_M_IRQ_EN),
++		 readl_relaxed(base + SE_GENI_M_IRQ_STATUS),
++		 readl_relaxed(base + SE_GENI_S_IRQ_EN),
++		 readl_relaxed(base + SE_GENI_S_IRQ_STATUS),
++		 readl_relaxed(base + SE_DMA_TX_IRQ_EN),
++		 readl_relaxed(base + SE_DMA_TX_IRQ_STAT),
++		 readl_relaxed(base + SE_DMA_RX_IRQ_EN),
++		 readl_relaxed(base + SE_DMA_RX_IRQ_STAT));
++}
++
+ static int spi_geni_init(struct spi_geni_master *mas)
+ {
+ 	struct spi_controller *spi = dev_get_drvdata(mas->dev);
+@@ -664,6 +691,8 @@ static int spi_geni_init(struct spi_geni_master *mas)
+ 		return ret;
+ 	}
+ 
++	spi_geni_log_irq_state(mas);
++
+ 	proto = geni_se_read_proto(se);
+ 
+ 	if (spi->target) {
+@@ -961,13 +990,21 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
+ 	struct spi_controller *spi = data;
+ 	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	struct geni_se *se = &mas->se;
+-	u32 m_irq, dma_tx_status, dma_rx_status;
++	u32 m_irq, s_irq, dma_tx_status, dma_rx_status;
++
++	/*
++	 * The SE clocks are off while runtime suspended. Runtime suspend
++	 * disables the IRQ, so this should not happen.
++	 */
++	if (pm_runtime_status_suspended(mas->dev))
++		return IRQ_NONE;
+ 
+ 	m_irq = readl(se->base + SE_GENI_M_IRQ_STATUS);
++	s_irq = readl_relaxed(se->base + SE_GENI_S_IRQ_STATUS);
+ 	dma_tx_status = readl_relaxed(se->base + SE_DMA_TX_IRQ_STAT);
+ 	dma_rx_status = readl_relaxed(se->base + SE_DMA_RX_IRQ_STAT);
+ 
+-	if (!m_irq && !dma_tx_status && !dma_rx_status)
++	if (!m_irq && !s_irq && !dma_tx_status && !dma_rx_status)
+ 		return IRQ_NONE;
+ 
+ 	if (m_irq & (M_CMD_OVERRUN_EN | M_ILLEGAL_CMD_EN | M_CMD_FAILURE_EN |
+@@ -977,6 +1014,25 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
+ 
+ 	spin_lock(&mas->lock);
+ 
++	/*
++	 * The secondary sequencer is never used, and outside SE DMA mode
++	 * nothing below handles the DMA status. Ack both (except in GPI mode)
++	 * so that a stale status cannot keep the line asserted.
++	 */
++	if (s_irq)
++		writel(s_irq, se->base + SE_GENI_S_IRQ_CLEAR);
++	if (mas->cur_xfer_mode != GENI_GPI_DMA) {
++		if (dma_tx_status)
++			writel(dma_tx_status, se->base + SE_DMA_TX_IRQ_CLR);
++		if (dma_rx_status)
++			writel(dma_rx_status, se->base + SE_DMA_RX_IRQ_CLR);
++	}
++	if (s_irq || (mas->cur_xfer_mode == GENI_SE_FIFO &&
++		      (dma_tx_status || dma_rx_status)))
++		dev_warn_ratelimited(mas->dev,
++				     "Unexpected IRQ status: s %#010x dma tx %#010x rx %#010x\n",
++				     s_irq, dma_tx_status, dma_rx_status);
++
+ 	if (mas->cur_xfer_mode == GENI_SE_FIFO) {
+ 		if ((m_irq & M_RX_FIFO_WATERMARK_EN) || (m_irq & M_RX_FIFO_LAST_EN))
+ 			geni_spi_handle_rx(mas);
+@@ -1016,10 +1072,6 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
+ 	} else if (mas->cur_xfer_mode == GENI_SE_DMA) {
+ 		const struct spi_transfer *xfer = mas->cur_xfer;
+ 
+-		if (dma_tx_status)
+-			writel(dma_tx_status, se->base + SE_DMA_TX_IRQ_CLR);
+-		if (dma_rx_status)
+-			writel(dma_rx_status, se->base + SE_DMA_RX_IRQ_CLR);
+ 		if (dma_tx_status & TX_DMA_DONE)
+ 			mas->tx_rem_bytes = 0;
+ 		if (dma_rx_status & RX_DMA_DONE)
+@@ -1129,6 +1181,17 @@ static int spi_geni_probe(struct platform_device *pdev)
+ 	init_completion(&mas->rx_reset_done);
+ 	spin_lock_init(&mas->lock);
+ 
++	/*
++	 * The SE interrupt is enabled only while runtime active, as in
++	 * i2c-qcom-geni. The extra disable_irq() keeps it off until
++	 * spi_geni_init() has cleared what the previous owner left pending.
++	 */
++	ret = devm_request_irq(dev, mas->irq, geni_spi_isr, IRQF_NO_AUTOEN,
++			       dev_name(dev), spi);
++	if (ret)
++		return ret;
++	disable_irq(mas->irq);
++
+ 	ret = geni_icc_get(&mas->se, NULL);
+ 	if (ret)
+ 		return ret;
+@@ -1154,6 +1217,8 @@ static int spi_geni_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	enable_irq(mas->irq);
++
+ 	/*
+ 	 * check the mode supported and set_cs for fifo mode only
+ 	 * for dma (gsi) mode, the gsi will set cs based on params passed in
+@@ -1168,10 +1233,6 @@ static int spi_geni_probe(struct platform_device *pdev)
+ 	if (mas->cur_xfer_mode == GENI_GPI_DMA)
+ 		spi->flags = SPI_CONTROLLER_MUST_TX;
+ 
+-	ret = devm_request_irq(dev, mas->irq, geni_spi_isr, 0, dev_name(dev), spi);
+-	if (ret)
+-		return ret;
+-
+ 	return devm_spi_register_controller(dev, spi);
+ }
+ 
+@@ -1181,12 +1242,16 @@ static int __maybe_unused spi_geni_runtime_suspend(struct device *dev)
+ 	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+ 	int ret;
+ 
++	disable_irq(mas->irq);
++
+ 	/* Drop the performance state vote */
+ 	dev_pm_opp_set_rate(dev, 0);
+ 
+ 	ret = geni_se_resources_off(&mas->se);
+-	if (ret)
++	if (ret) {
++		enable_irq(mas->irq);
+ 		return ret;
++	}
+ 
+ 	return geni_icc_disable(&mas->se);
+ }
+@@ -1205,7 +1270,13 @@ static int __maybe_unused spi_geni_runtime_resume(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	return dev_pm_opp_set_rate(mas->dev, mas->cur_sclk_hz);
++	ret = dev_pm_opp_set_rate(mas->dev, mas->cur_sclk_hz);
++	if (ret)
++		return ret;
++
++	enable_irq(mas->irq);
++
++	return 0;
+ }
+ 
+ static int __maybe_unused spi_geni_suspend(struct device *dev)

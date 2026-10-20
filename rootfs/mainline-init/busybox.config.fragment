@@ -1,0 +1,6 @@
+# Overrides applied on top of BusyBox 1.36.1 `make defconfig` by
+# build-static-tools-in-container.sh. KEY=y/n/value, one per line.
+CONFIG_STATIC=y
+# tc does not build against current kernel headers (CBQ removed upstream) and is
+# not in busybox-applets.txt.
+CONFIG_TC=n

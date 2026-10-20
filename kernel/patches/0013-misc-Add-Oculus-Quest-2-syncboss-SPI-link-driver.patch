@@ -1,0 +1,1356 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mac <xmachd@gmail.com>
+Date: Tue, 20 Oct 2026 12:00:00 +0000
+Subject: [PATCH 13/16] misc: Add Oculus Quest 2 syncboss SPI link driver
+
+The Oculus Quest 2 has an nRF52832 sensor-hub MCU ("syncboss") on SPI
+that carries the IMU, magnetometer, controller and proximity data. This
+is a rewrite of the transport part of the vendor's GPL-2.0 driver,
+keeping its device names and record format (syncboss0,
+syncboss_stream0, syncboss_control0).
+
+It has no MCU programming path, and userspace can send only the IMU
+start and stop commands, matched byte for byte against a table. On last
+close the driver sends the vendor SHUTDOWN packet and holds the MCU in
+reset. syncboss0 refuses to open if frames would use SE DMA and
+quest2_syncboss.identity_dma=1 is not set.
+
+The wire-format helpers have KUnit tests.
+
+Signed-off-by: mac <xmachd@gmail.com>
+---
+ drivers/misc/Kconfig                 |  19 +
+ drivers/misc/Makefile                |   2 +
+ drivers/misc/quest2-syncboss-proto.h | 158 +++++
+ drivers/misc/quest2-syncboss-test.c  | 247 ++++++++
+ drivers/misc/quest2-syncboss.c       | 862 +++++++++++++++++++++++++++
+ 5 files changed, 1288 insertions(+)
+ create mode 100644 drivers/misc/quest2-syncboss-proto.h
+ create mode 100644 drivers/misc/quest2-syncboss-test.c
+ create mode 100644 drivers/misc/quest2-syncboss.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index b9c11f673..0613092b6 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -644,6 +644,25 @@ config MCHP_LAN966X_PCI
+ 	    - lan966x-miim (MDIO_MSCC_MIIM)
+ 	    - lan966x-switch (LAN966X_SWITCH)
+ 
++config QUEST2_SYNCBOSS
++	tristate "Oculus Quest 2 syncboss MCU link (IMU stream subset)"
++	depends on SPI && OF && GPIOLIB && REGULATOR
++	help
++	  SPI link to the syncboss nRF52832 MCU on the Oculus Quest 2
++	  ("hollywood"). Provides /dev/syncboss0, /dev/syncboss_stream0 and
++	  /dev/syncboss_control0 with the vendor driver's record format.
++	  Userspace can send only the IMU start and stop commands; the driver
++	  itself sends only the SHUTDOWN command on last close. There is no
++	  MCU firmware programming path.
++
++config QUEST2_SYNCBOSS_KUNIT_TEST
++	tristate "KUnit tests for the Quest 2 syncboss wire format" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  Tests the frame builder, checksum, RX frame checks, packet parser
++	  and command allowlist of the Quest 2 syncboss driver.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index b32a2597d..d0d9d984f 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -75,3 +75,5 @@ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-$(CONFIG_QUEST2_SYNCBOSS)	+= quest2-syncboss.o
++obj-$(CONFIG_QUEST2_SYNCBOSS_KUNIT_TEST)	+= quest2-syncboss-test.o
+diff --git a/drivers/misc/quest2-syncboss-proto.h b/drivers/misc/quest2-syncboss-proto.h
+new file mode 100644
+index 000000000..dca492696
+--- /dev/null
++++ b/drivers/misc/quest2-syncboss-proto.h
+@@ -0,0 +1,158 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Quest 2 syncboss MCU link: wire format helpers, no hardware access.
++ *
++ * Frame and packet layout as in the vendor's syncboss driver (struct
++ * transaction_header, struct syncboss_data). Covered by quest2-syncboss-test.c.
++ */
++#ifndef _QUEST2_SYNCBOSS_PROTO_H
++#define _QUEST2_SYNCBOSS_PROTO_H
++
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++
++#define SB_TRANS_LEN		248		/* bytes per SPI transaction */
++#define SB_FRAME_HDR_LEN	5		/* u32 magic + u8 checksum */
++#define SB_PKT_HDR_LEN		3		/* u8 type, u8 seq, u8 len */
++#define SB_TX_MAGIC		0xDEFEC8EDu	/* host -> MCU frame */
++#define SB_RX_MAGIC		0xD00D1E8Du	/* MCU -> host frame */
++#define SB_RX_MAGIC_BUSY	0xCACACACAu	/* MCU busy, no data */
++
++/* Record header prepended for userspace: vendor uapi v2 (12 bytes) */
++#define SB_REC_HDR_VERSION	2
++#define SB_REC_HDR_LEN		12
++#define SB_REC_MAX_LEN		(SB_REC_HDR_LEN + SB_PKT_HDR_LEN + 255)
++
++/*
++ * Every command that can reach the MCU. Userspace can select only the two
++ * entries of sb_allowed_cmds[] (IMU start 0x6e, IMU stop 0x6f), matched byte
++ * for byte. SHUTDOWN (type 0x5a, seq 0, len 0) is sent by the driver itself on
++ * last close. Otherwise only the all-zero polling payload is sent.
++ */
++#define SB_CMD_LEN		4
++#define SB_CMD_NONE		0
++#define SB_CMD_IMU_ENABLE	1
++#define SB_CMD_IMU_DISABLE	2
++#define SB_CMD_COUNT		2	/* userspace-selectable commands */
++#define SB_CMD_SHUTDOWN		3	/* driver-internal only */
++
++static const u8 sb_shutdown_pkt[SB_PKT_HDR_LEN] = { 0x5a, 0x00, 0x00 };
++
++static const u8 sb_allowed_cmds[SB_CMD_COUNT][SB_CMD_LEN] = {
++	[SB_CMD_IMU_ENABLE - 1]  = { 0x6e, 0x01, 0x01, 0x00 },
++	[SB_CMD_IMU_DISABLE - 1] = { 0x6f, 0x02, 0x01, 0x00 },
++};
++
++/*
++ * Map a userspace write to an allowlisted command. Returns SB_CMD_IMU_* or
++ * SB_CMD_NONE if the buffer is not exactly one of the allowlisted packets.
++ */
++static inline int sb_cmd_lookup(const u8 *buf, size_t len)
++{
++	int i;
++
++	if (len != SB_CMD_LEN)
++		return SB_CMD_NONE;
++	for (i = 0; i < SB_CMD_COUNT; i++)
++		if (!memcmp(buf, sb_allowed_cmds[i], SB_CMD_LEN))
++			return i + 1;
++	return SB_CMD_NONE;
++}
++
++/* Byte that makes all @len bytes sum to 0 mod 256 */
++static inline u8 sb_checksum(const u8 *buf, size_t len)
++{
++	u8 sum = 0;
++	size_t i;
++
++	for (i = 0; i < len; i++)
++		sum += buf[i];
++	return (u8)(0 - sum);
++}
++
++/* Constant payload for @cmd, or NULL for none/out of range */
++static inline const u8 *sb_cmd_payload(int cmd, size_t *len)
++{
++	if (cmd >= 1 && cmd <= SB_CMD_COUNT) {
++		*len = SB_CMD_LEN;
++		return sb_allowed_cmds[cmd - 1];
++	}
++	if (cmd == SB_CMD_SHUTDOWN) {
++		*len = sizeof(sb_shutdown_pkt);
++		return sb_shutdown_pkt;
++	}
++	*len = 0;
++	return NULL;
++}
++
++/*
++ * Build a TX frame: magic, checksum, then the packet for @cmd or an all-zero
++ * payload. The payload comes only from the constant tables above.
++ */
++static inline void sb_build_tx_frame(u8 *frame, int cmd)
++{
++	const u8 *pkt;
++	size_t len;
++
++	memset(frame, 0, SB_TRANS_LEN);
++	put_unaligned_le32(SB_TX_MAGIC, frame);
++	pkt = sb_cmd_payload(cmd, &len);
++	if (pkt)
++		memcpy(frame + SB_FRAME_HDR_LEN, pkt, len);
++	frame[4] = sb_checksum(frame, SB_TRANS_LEN);
++}
++
++/*
++ * Validate an RX frame: 0 if good, -EAGAIN for the MCU-busy magic, -EIO for any
++ * other magic, -EBADMSG for a checksum mismatch.
++ */
++static inline int sb_check_rx_frame(const u8 *frame)
++{
++	u32 magic = get_unaligned_le32(frame);
++
++	if (magic == SB_RX_MAGIC_BUSY)
++		return -EAGAIN;
++	if (magic != SB_RX_MAGIC)
++		return -EIO;
++	if (sb_checksum(frame, SB_TRANS_LEN) != 0)
++		return -EBADMSG;
++	return 0;
++}
++
++/*
++ * Packet iterator over a validated RX frame. @off is the offset of the next
++ * packet (start with SB_FRAME_HDR_LEN). Returns the packet length including its
++ * header, 0 at the end of the list (type 0 or no room for a header), or
++ * -EOVERFLOW if the packet would run past the frame.
++ */
++static inline int sb_next_packet(const u8 *frame, size_t off)
++{
++	size_t plen;
++
++	if (off + SB_PKT_HDR_LEN > SB_TRANS_LEN)
++		return 0;
++	if (frame[off] == 0)
++		return 0;
++	plen = SB_PKT_HDR_LEN + frame[off + 2];
++	if (off + plen > SB_TRANS_LEN)
++		return -EOVERFLOW;
++	return plen;
++}
++
++/*
++ * Build the userspace record for one packet: the 12-byte v2 header (version 2,
++ * length 12, everything else 0) followed by the packet. @rec must hold
++ * SB_REC_MAX_LEN bytes. Returns the record length.
++ */
++static inline size_t sb_build_record(u8 *rec, const u8 *pkt, size_t plen)
++{
++	memset(rec, 0, SB_REC_HDR_LEN);
++	rec[0] = SB_REC_HDR_VERSION;
++	rec[1] = SB_REC_HDR_LEN;
++	memcpy(rec + SB_REC_HDR_LEN, pkt, plen);
++	return SB_REC_HDR_LEN + plen;
++}
++
++#endif /* _QUEST2_SYNCBOSS_PROTO_H */
+diff --git a/drivers/misc/quest2-syncboss-test.c b/drivers/misc/quest2-syncboss-test.c
+new file mode 100644
+index 000000000..e270fcab1
+--- /dev/null
++++ b/drivers/misc/quest2-syncboss-test.c
+@@ -0,0 +1,247 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * KUnit tests for the Quest 2 syncboss wire-format helpers
++ * (quest2-syncboss-proto.h). No hardware access.
++ */
++#include <kunit/test.h>
++
++#include "quest2-syncboss-proto.h"
++
++static u8 sum_bytes(const u8 *b, size_t n)
++{
++	u8 s = 0;
++
++	while (n--)
++		s += *b++;
++	return s;
++}
++
++static void sb_test_allowlist(struct kunit *test)
++{
++	static const u8 en[] = { 0x6e, 0x01, 0x01, 0x00 };
++	static const u8 dis[] = { 0x6f, 0x02, 0x01, 0x00 };
++	u8 buf[8];
++	int i, b;
++
++	KUNIT_EXPECT_EQ(test, sb_cmd_lookup(en, 4), SB_CMD_IMU_ENABLE);
++	KUNIT_EXPECT_EQ(test, sb_cmd_lookup(dis, 4), SB_CMD_IMU_DISABLE);
++
++	/* wrong lengths */
++	KUNIT_EXPECT_EQ(test, sb_cmd_lookup(en, 3), SB_CMD_NONE);
++	memcpy(buf, en, 4);
++	buf[4] = 0;
++	KUNIT_EXPECT_EQ(test, sb_cmd_lookup(buf, 5), SB_CMD_NONE);
++	KUNIT_EXPECT_EQ(test, sb_cmd_lookup(buf, 0), SB_CMD_NONE);
++
++	/* every single-bit change of either packet is refused */
++	for (i = 0; i < 4; i++) {
++		for (b = 0; b < 8; b++) {
++			memcpy(buf, en, 4);
++			buf[i] ^= 1 << b;
++			KUNIT_EXPECT_EQ(test, sb_cmd_lookup(buf, 4), SB_CMD_NONE);
++			memcpy(buf, dis, 4);
++			buf[i] ^= 1 << b;
++			KUNIT_EXPECT_EQ(test, sb_cmd_lookup(buf, 4), SB_CMD_NONE);
++		}
++	}
++
++	/* SHUTDOWN (type 90) and other sequence ids are not allowlisted */
++	buf[0] = 90; buf[1] = 0; buf[2] = 0; buf[3] = 0;
++	KUNIT_EXPECT_EQ(test, sb_cmd_lookup(buf, 4), SB_CMD_NONE);
++	memcpy(buf, en, 4);
++	buf[1] = 3;
++	KUNIT_EXPECT_EQ(test, sb_cmd_lookup(buf, 4), SB_CMD_NONE);
++}
++
++static void sb_test_tx_frame(struct kunit *test)
++{
++	u8 f[SB_TRANS_LEN];
++	int cmd, i;
++
++	for (cmd = SB_CMD_NONE; cmd <= SB_CMD_COUNT; cmd++) {
++		sb_build_tx_frame(f, cmd);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f), SB_TX_MAGIC);
++		KUNIT_EXPECT_EQ(test, f[0], 0xed);
++		KUNIT_EXPECT_EQ(test, sum_bytes(f, SB_TRANS_LEN), 0);
++		if (cmd)
++			KUNIT_EXPECT_MEMEQ(test, f + 5, sb_allowed_cmds[cmd - 1], 4);
++		for (i = cmd ? 9 : 5; i < SB_TRANS_LEN; i++)
++			KUNIT_EXPECT_EQ(test, f[i], 0);
++	}
++
++	/* out-of-range command index sends the empty frame */
++	sb_build_tx_frame(f, SB_CMD_SHUTDOWN + 1);
++	for (i = 5; i < SB_TRANS_LEN; i++)
++		KUNIT_EXPECT_EQ(test, f[i], 0);
++	sb_build_tx_frame(f, -1);
++	for (i = 5; i < SB_TRANS_LEN; i++)
++		KUNIT_EXPECT_EQ(test, f[i], 0);
++}
++
++/*
++ * SHUTDOWN is driver-internal: no userspace buffer may select it. Covers the
++ * exact vendor-driver packet, padded variants, and every type byte combined
++ * with the plausible seq/len/data values.
++ */
++static void sb_test_shutdown_not_user_selectable(struct kunit *test)
++{
++	static const u8 seqs[] = { 0x00, 0x01, 0x02, 0xff };
++	u8 buf[8] = { 0 };
++	size_t len;
++	int t, si, l, d, r;
++
++	memcpy(buf, sb_shutdown_pkt, 3);
++	for (len = 0; len <= sizeof(buf); len++)
++		KUNIT_EXPECT_EQ(test, sb_cmd_lookup(buf, len), SB_CMD_NONE);
++
++	for (t = 0; t < 256; t++)
++		for (si = 0; si < ARRAY_SIZE(seqs); si++)
++			for (l = 0; l < 2; l++)
++				for (d = 0; d < 2; d++) {
++					buf[0] = t;
++					buf[1] = seqs[si];
++					buf[2] = l;
++					buf[3] = d;
++					r = sb_cmd_lookup(buf, 4);
++					KUNIT_EXPECT_NE(test, r, SB_CMD_SHUTDOWN);
++					KUNIT_EXPECT_TRUE(test, r == SB_CMD_NONE ||
++							  !memcmp(buf, sb_allowed_cmds[r - 1], 4));
++				}
++
++	/* the table entry is the exact vendor-driver packet: type 90, seq 0, len 0 */
++	KUNIT_EXPECT_EQ(test, sb_shutdown_pkt[0], 90);
++	KUNIT_EXPECT_EQ(test, sb_shutdown_pkt[1], 0);
++	KUNIT_EXPECT_EQ(test, sb_shutdown_pkt[2], 0);
++	KUNIT_EXPECT_PTR_EQ(test, sb_cmd_payload(SB_CMD_SHUTDOWN, &len),
++			    &sb_shutdown_pkt[0]);
++	KUNIT_EXPECT_EQ(test, len, (size_t)3);
++	KUNIT_EXPECT_NULL(test, sb_cmd_payload(SB_CMD_NONE, &len));
++	KUNIT_EXPECT_NULL(test, sb_cmd_payload(SB_CMD_SHUTDOWN + 1, &len));
++}
++
++static void sb_test_shutdown_frame(struct kunit *test)
++{
++	static const u8 pkt[] = { 0x5a, 0x00, 0x00 };
++	u8 f[SB_TRANS_LEN];
++	int i;
++
++	sb_build_tx_frame(f, SB_CMD_SHUTDOWN);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f), SB_TX_MAGIC);
++	KUNIT_EXPECT_EQ(test, sum_bytes(f, SB_TRANS_LEN), 0);
++	KUNIT_EXPECT_MEMEQ(test, f + 5, pkt, sizeof(pkt));
++	for (i = 8; i < SB_TRANS_LEN; i++)
++		KUNIT_EXPECT_EQ(test, f[i], 0);
++}
++
++static void make_rx(u8 *f, const u8 *payload, size_t n)
++{
++	memset(f, 0, SB_TRANS_LEN);
++	put_unaligned_le32(SB_RX_MAGIC, f);
++	memcpy(f + 5, payload, n);
++	f[4] = sb_checksum(f, SB_TRANS_LEN);
++}
++
++static void sb_test_rx_check(struct kunit *test)
++{
++	static const u8 p[] = { 0x50, 0x00, 0x02, 0xaa, 0xbb };
++	u8 f[SB_TRANS_LEN];
++
++	make_rx(f, p, sizeof(p));
++	KUNIT_EXPECT_EQ(test, sb_check_rx_frame(f), 0);
++
++	f[100] ^= 1;
++	KUNIT_EXPECT_EQ(test, sb_check_rx_frame(f), -EBADMSG);
++
++	memset(f, 0xca, SB_TRANS_LEN);
++	KUNIT_EXPECT_EQ(test, sb_check_rx_frame(f), -EAGAIN);
++
++	make_rx(f, p, sizeof(p));
++	put_unaligned_le32(SB_TX_MAGIC, f);
++	KUNIT_EXPECT_EQ(test, sb_check_rx_frame(f), -EIO);
++}
++
++static void sb_test_parser(struct kunit *test)
++{
++	u8 f[SB_TRANS_LEN];
++	u8 pl[SB_TRANS_LEN];
++	size_t off;
++	int n;
++
++	/* two packets then type 0 */
++	memset(pl, 0, sizeof(pl));
++	pl[0] = 0x50; pl[1] = 0; pl[2] = 2;
++	pl[5] = 0x7d; pl[6] = 1; pl[7] = 4;
++	make_rx(f, pl, 12);
++	off = 5;
++	n = sb_next_packet(f, off);
++	KUNIT_EXPECT_EQ(test, n, 5);
++	off += n;
++	n = sb_next_packet(f, off);
++	KUNIT_EXPECT_EQ(test, n, 7);
++	off += n;
++	KUNIT_EXPECT_EQ(test, sb_next_packet(f, off), 0);
++
++	/* empty frame */
++	make_rx(f, pl, 0);
++	KUNIT_EXPECT_EQ(test, sb_next_packet(f, 5), 0);
++
++	/* packet that ends exactly at the frame end is accepted */
++	memset(pl, 0, sizeof(pl));
++	pl[0] = 0x92; pl[1] = 0xff; pl[2] = SB_TRANS_LEN - 5 - 3;
++	make_rx(f, pl, SB_TRANS_LEN - 5);
++	KUNIT_EXPECT_EQ(test, sb_next_packet(f, 5), SB_TRANS_LEN - 5);
++	KUNIT_EXPECT_EQ(test, sb_next_packet(f, SB_TRANS_LEN), 0);
++
++	/* one byte too long overflows */
++	pl[2] = SB_TRANS_LEN - 5 - 3 + 1;
++	make_rx(f, pl, SB_TRANS_LEN - 5);
++	KUNIT_EXPECT_EQ(test, sb_next_packet(f, 5), -EOVERFLOW);
++
++	/* maximum declared length overflows */
++	pl[2] = 255;
++	make_rx(f, pl, SB_TRANS_LEN - 5);
++	KUNIT_EXPECT_EQ(test, sb_next_packet(f, 5), -EOVERFLOW);
++
++	/* header that does not fit in the last two bytes ends the list */
++	memset(f, 0xff, SB_TRANS_LEN);
++	KUNIT_EXPECT_EQ(test, sb_next_packet(f, SB_TRANS_LEN - 2), 0);
++	KUNIT_EXPECT_EQ(test, sb_next_packet(f, SB_TRANS_LEN - 3), -EOVERFLOW);
++}
++
++static void sb_test_record(struct kunit *test)
++{
++	static const u8 pkt[] = { 0x7d, 0x01, 0x04, 0, 0, 0, 0 };
++	u8 rec[SB_REC_MAX_LEN];
++	size_t n;
++	int i;
++
++	memset(rec, 0xff, sizeof(rec));
++	n = sb_build_record(rec, pkt, sizeof(pkt));
++	KUNIT_EXPECT_EQ(test, n, (size_t)SB_REC_HDR_LEN + sizeof(pkt));
++	KUNIT_EXPECT_EQ(test, rec[0], 2);
++	KUNIT_EXPECT_EQ(test, rec[1], 12);
++	for (i = 2; i < 12; i++)
++		KUNIT_EXPECT_EQ(test, rec[i], 0);
++	KUNIT_EXPECT_MEMEQ(test, rec + 12, pkt, sizeof(pkt));
++}
++
++static struct kunit_case sb_test_cases[] = {
++	KUNIT_CASE(sb_test_allowlist),
++	KUNIT_CASE(sb_test_tx_frame),
++	KUNIT_CASE(sb_test_shutdown_not_user_selectable),
++	KUNIT_CASE(sb_test_shutdown_frame),
++	KUNIT_CASE(sb_test_rx_check),
++	KUNIT_CASE(sb_test_parser),
++	KUNIT_CASE(sb_test_record),
++	{}
++};
++
++static struct kunit_suite sb_test_suite = {
++	.name = "quest2-syncboss",
++	.test_cases = sb_test_cases,
++};
++
++kunit_test_suite(sb_test_suite);
++
++MODULE_DESCRIPTION("KUnit tests for the Quest 2 syncboss wire format");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/quest2-syncboss.c b/drivers/misc/quest2-syncboss.c
+new file mode 100644
+index 000000000..64b583a7a
+--- /dev/null
++++ b/drivers/misc/quest2-syncboss.c
+@@ -0,0 +1,862 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Oculus Quest 2 ("hollywood") syncboss MCU link.
++ *
++ * The syncboss nRF52832 MCU multiplexes the IMU, magnetometer, controllers
++ * and proximity sensor onto one SPI link. This is a rewrite of the transport
++ * part of the vendor's GPL-2.0 driver (oculus-linux-kernel,
++ * drivers/staging/oculus/mcu/syncboss/), with its device names and record
++ * format:
++ *
++ *  /dev/syncboss0          open starts the MCU and the stream; write sends
++ *                          one allowlisted command
++ *  /dev/syncboss_stream0   packets with sequence id 0
++ *  /dev/syncboss_control0  all other packets
++ *
++ * There is no MCU programming path. Userspace can send only the IMU start
++ * and stop commands in quest2-syncboss-proto.h; the driver itself sends only
++ * the empty polling frame and, on last close, SHUTDOWN.
++ */
++
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/fs.h>
++#include <linux/gpio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/kfifo.h>
++#include <linux/kthread.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mod_devicetable.h>
++#include <linux/mutex.h>
++#include <linux/poll.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
++
++#include "quest2-syncboss-proto.h"
++
++/* Timing constants, all as in the vendor driver and device tree */
++#define SB_SPI_MAX_HZ		8000000	/* spi-max-frequency */
++#define SB_MIN_GAP_US		500	/* min-time-between-trans-ns 500000 */
++#define SB_RESET_MS		5	/* SYNCBOSS_RESET_TIME_MS */
++#define SB_WAKE_POLL_MS		20	/* ready-line poll interval */
++#define SB_WAKE_TIMEOUT_MS	5000	/* ..._WITH_GRACE_MS */
++#define SB_RESET_SETTLE_MS	100	/* no error logs right after reset */
++
++/* Local limits (not in the vendor driver): bound every failure loop */
++#define SB_MAX_CONSEC_ERRORS	2000	/* ~1 s of bad frames at the 500 us gap */
++#define SB_MAX_CMD_ATTEMPTS	20	/* tries to deliver one command */
++#define SB_IRQ_STORM_PER_SEC	20000	/* ~20x the nominal ~1 kHz ready rate */
++
++#define SB_FIFO_SIZE		8192	/* per open reader, power of two */
++#define SB_BUF_SIZE		256	/* SB_TRANS_LEN rounded up to cache lines */
++
++/*
++ * SE19 DMA addresses are only valid if the QUP2 stream (SID 0x63) is attached
++ * to an IOMMU domain or identity-mapped by the boot loader. Without
++ * identity_dma=1, syncboss0 refuses to open when a frame would use DMA.
++ */
++static bool identity_dma;
++module_param(identity_dma, bool, 0444);
++MODULE_PARM_DESC(identity_dma,
++		 "QUP2 SE-DMA stream is IOMMU-attached or identity-mapped (default 0)");
++
++static const char * const sb_supply_names[] = {
++	"vdd",	/* pm8150 S4 1.8 V */
++	"imu",	/* pm8150l L7 3.0 V */
++	"mag",	/* pm8150l L8 1.8 V */
++};
++
++struct sb_dev;
++
++struct sb_reader {
++	struct list_head node;
++	struct sb_dev *sb;
++	bool control;
++	spinlock_t lock;		/* protects fifo */
++	struct kfifo_rec_ptr_2 fifo;
++	unsigned long dropped;
++};
++
++struct sb_misc {
++	struct miscdevice misc;
++	struct sb_dev *sb;
++};
++
++struct sb_dev {
++	struct spi_device *spi;
++	struct device *dev;
++	struct gpio_desc *reset;
++	struct gpio_desc *ready;
++	struct regulator_bulk_data supplies[ARRAY_SIZE(sb_supply_names)];
++	int irq;
++	bool uses_dma;			/* controller will DMA a frame */
++
++	u8 *tx_buf;			/* DMA-able, SB_BUF_SIZE */
++	u8 *rx_buf;
++	struct spi_transfer xfer;
++	struct spi_message msg;
++
++	struct mutex state_lock;	/* users, streaming state */
++	unsigned int users;
++	bool streaming;
++	bool gone;			/* removed or shut down */
++	struct task_struct *thread;
++	wait_queue_head_t thread_wq;
++	atomic_t ready_fired;
++	atomic_t cmd_pending;		/* SB_CMD_* */
++	bool stream_failed;
++
++	/* IRQ storm guard, ISR only */
++	unsigned long irq_window_end;
++	unsigned int irq_window_count;
++	atomic_t irq_storm;
++
++	spinlock_t readers_lock;	/* protects readers */
++	struct list_head readers;
++	wait_queue_head_t read_wq;
++
++	unsigned long reset_release_jiffies;
++
++	/* statistics, reset per stream, logged at stream stop */
++	struct {
++		u64 trans, bad_magic, bad_csum, busy, spi_err, overflow;
++		u64 cmds_sent;
++	} st;
++
++	struct sb_misc m_main, m_stream, m_control;
++};
++
++static bool sb_mcu_awake(struct sb_dev *sb)
++{
++	/* high = awake; require a stable low for "asleep" */
++	if (gpiod_get_value_cansleep(sb->ready))
++		return true;
++	udelay(5);
++	return gpiod_get_value_cansleep(sb->ready);
++}
++
++/* Hold the MCU in reset and remove the switched supplies */
++static void sb_mcu_off(struct sb_dev *sb)
++{
++	gpiod_set_value_cansleep(sb->reset, 1);
++	regulator_bulk_disable(ARRAY_SIZE(sb->supplies), sb->supplies);
++}
++
++/* Power, pin-reset and wait for the MCU */
++static int sb_mcu_on(struct sb_dev *sb)
++{
++	unsigned long deadline;
++	int ret;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(sb->supplies), sb->supplies);
++	if (ret) {
++		dev_err(sb->dev, "failed to enable supplies: %d\n", ret);
++		gpiod_set_value_cansleep(sb->reset, 1);
++		return ret;
++	}
++
++	gpiod_set_value_cansleep(sb->reset, 1);
++	msleep(SB_RESET_MS);
++	gpiod_set_value_cansleep(sb->reset, 0);
++	sb->reset_release_jiffies = jiffies;
++
++	deadline = jiffies + msecs_to_jiffies(SB_WAKE_TIMEOUT_MS);
++	for (;;) {
++		if (sb_mcu_awake(sb)) {
++			dev_info(sb->dev, "MCU awake after %u ms\n",
++				 jiffies_to_msecs(jiffies - sb->reset_release_jiffies));
++			return 0;
++		}
++		if (time_after(jiffies, deadline))
++			break;
++		msleep(SB_WAKE_POLL_MS);
++	}
++
++	dev_err(sb->dev, "MCU not awake within %d ms\n", SB_WAKE_TIMEOUT_MS);
++	sb_mcu_off(sb);
++	return -ETIMEDOUT;
++}
++
++static irqreturn_t sb_ready_isr(int irq, void *data)
++{
++	struct sb_dev *sb = data;
++	unsigned long now = jiffies;
++
++	if (time_after(now, sb->irq_window_end)) {
++		sb->irq_window_end = now + HZ;
++		sb->irq_window_count = 0;
++	}
++	/* at most once per stream: disable depth stays balanced */
++	if (++sb->irq_window_count > SB_IRQ_STORM_PER_SEC &&
++	    !atomic_xchg(&sb->irq_storm, 1))
++		disable_irq_nosync(irq);
++
++	atomic_set(&sb->ready_fired, 1);
++	wake_up(&sb->thread_wq);
++	return IRQ_HANDLED;
++}
++
++static void sb_deliver(struct sb_dev *sb, const u8 *pkt, size_t plen)
++{
++	u8 rec[SB_REC_MAX_LEN];
++	struct sb_reader *r;
++	bool control = pkt[1] != 0;	/* seq 0 -> stream */
++	size_t len;
++
++	len = sb_build_record(rec, pkt, plen);
++
++	spin_lock(&sb->readers_lock);
++	list_for_each_entry(r, &sb->readers, node) {
++		if (r->control != control)
++			continue;
++		spin_lock(&r->lock);
++		if (!kfifo_in(&r->fifo, rec, len)) {
++			if (!r->dropped++)
++				dev_warn_ratelimited(sb->dev,
++						     "%s reader full, dropping\n",
++						     control ? "control" : "stream");
++		} else {
++			r->dropped = 0;
++		}
++		spin_unlock(&r->lock);
++	}
++	spin_unlock(&sb->readers_lock);
++}
++
++static void sb_process_rx(struct sb_dev *sb)
++{
++	size_t off = SB_FRAME_HDR_LEN;
++	int plen;
++
++	while ((plen = sb_next_packet(sb->rx_buf, off)) > 0) {
++		sb_deliver(sb, sb->rx_buf + off, plen);
++		off += plen;
++	}
++	if (plen == -EOVERFLOW) {
++		sb->st.overflow++;
++		dev_err_ratelimited(sb->dev, "data packet overflow\n");
++	}
++}
++
++static bool sb_thread_wake_cond(struct sb_dev *sb)
++{
++	return kthread_should_stop() || atomic_read(&sb->ready_fired) ||
++	       atomic_read(&sb->cmd_pending) || atomic_read(&sb->irq_storm);
++}
++
++static int sb_thread(void *data)
++{
++	struct sb_dev *sb = data;
++	unsigned int consec_err = 0, cmd_attempts = 0;
++	ktime_t last_end = 0;
++	int ret;
++
++	while (!kthread_should_stop()) {
++		bool ready, settling;
++		s64 since_us;
++		int cmd;
++
++		wait_event_interruptible(sb->thread_wq, sb_thread_wake_cond(sb));
++		if (kthread_should_stop())
++			break;
++		if (atomic_read(&sb->irq_storm)) {
++			dev_err(sb->dev, "ready IRQ storm, stopping stream\n");
++			goto failed;
++		}
++
++		/* Minimum gap from the end of the previous transaction */
++		since_us = ktime_us_delta(ktime_get(), last_end);
++		if (since_us < SB_MIN_GAP_US)
++			usleep_range(SB_MIN_GAP_US - since_us,
++				     SB_MIN_GAP_US - since_us + 50);
++
++		ready = atomic_xchg(&sb->ready_fired, 0);
++		cmd = atomic_read(&sb->cmd_pending);
++		sb_build_tx_frame(sb->tx_buf, cmd);
++
++		ret = spi_sync_locked(sb->spi, &sb->msg);
++		last_end = ktime_get();
++		settling = time_before(jiffies, sb->reset_release_jiffies +
++				       msecs_to_jiffies(SB_RESET_SETTLE_MS));
++
++		if (!ret) {
++			sb->st.trans++;
++			ret = sb_check_rx_frame(sb->rx_buf);
++			if (ret == -EAGAIN)
++				sb->st.busy++;
++			else if (ret == -EIO)
++				sb->st.bad_magic++;
++			else if (ret == -EBADMSG)
++				sb->st.bad_csum++;
++			if (ret && !settling && ret != -EAGAIN)
++				dev_err_ratelimited(sb->dev, "bad frame from MCU: %d (magic 0x%08x)\n",
++						    ret, get_unaligned_le32(sb->rx_buf));
++		} else {
++			sb->st.spi_err++;
++			dev_err_ratelimited(sb->dev, "spi_sync_locked: %d\n", ret);
++		}
++
++		if (ret) {
++			if (++consec_err > SB_MAX_CONSEC_ERRORS) {
++				dev_err(sb->dev, "%u consecutive failed transactions, stopping stream\n",
++					consec_err);
++				goto failed;
++			}
++			/* MCU busy while it had data: retry the read */
++			if (ret == -EAGAIN && ready)
++				atomic_set(&sb->ready_fired, 1);
++			if (cmd && ++cmd_attempts >= SB_MAX_CMD_ATTEMPTS) {
++				dev_err(sb->dev, "dropping command %d after %u attempts\n",
++					cmd, cmd_attempts);
++				atomic_cmpxchg(&sb->cmd_pending, cmd, SB_CMD_NONE);
++				cmd_attempts = 0;
++			}
++			continue;
++		}
++
++		consec_err = 0;
++		if (cmd) {
++			/* the MCU acknowledged a frame carrying the command */
++			atomic_cmpxchg(&sb->cmd_pending, cmd, SB_CMD_NONE);
++			cmd_attempts = 0;
++			sb->st.cmds_sent++;
++			const u8 *pkt;
++			size_t plen;
++
++			pkt = sb_cmd_payload(cmd, &plen);
++			dev_info(sb->dev, "sent command %*ph\n", (int)plen, pkt);
++		}
++
++		sb_process_rx(sb);
++		wake_up_interruptible(&sb->read_wq);
++	}
++	return 0;
++
++failed:
++	sb->stream_failed = true;
++	atomic_set(&sb->cmd_pending, SB_CMD_NONE);
++	wake_up_interruptible(&sb->read_wq);
++	/* wait for sb_stream_stop() */
++	for (;;) {
++		set_current_state(TASK_INTERRUPTIBLE);
++		if (kthread_should_stop())
++			break;
++		schedule();
++	}
++	__set_current_state(TASK_RUNNING);
++	return 0;
++}
++
++static void sb_reset_readers(struct sb_dev *sb)
++{
++	struct sb_reader *r;
++
++	/* unread data is discarded when the MCU goes down */
++	spin_lock(&sb->readers_lock);
++	list_for_each_entry(r, &sb->readers, node) {
++		spin_lock(&r->lock);
++		kfifo_reset(&r->fifo);
++		spin_unlock(&r->lock);
++	}
++	spin_unlock(&sb->readers_lock);
++}
++
++static int sb_stream_start(struct sb_dev *sb)
++{
++	struct spi_controller *ctlr = sb->spi->controller;
++	struct task_struct *t;
++	int ret;
++
++	ret = sb_mcu_on(sb);
++	if (ret)
++		return ret;
++
++	/* keep the SE active (pads, clocks) for the whole stream */
++	ret = pm_runtime_resume_and_get(ctlr->dev.parent);
++	if (ret < 0) {
++		dev_err(sb->dev, "controller resume failed: %d\n", ret);
++		goto err_off;
++	}
++
++	spi_bus_lock(ctlr);
++
++	/*
++	 * The ready IRQ is only enabled from here on, so the MCU's boot edge is
++	 * missed: start with one polling frame.
++	 */
++	atomic_set(&sb->ready_fired, 1);
++	atomic_set(&sb->cmd_pending, SB_CMD_NONE);
++	atomic_set(&sb->irq_storm, 0);
++	sb->irq_window_end = jiffies;
++	sb->irq_window_count = 0;
++	sb->stream_failed = false;
++	memset(&sb->st, 0, sizeof(sb->st));
++
++	t = kthread_create(sb_thread, sb, "syncboss:spi_thread");
++	if (IS_ERR(t)) {
++		ret = PTR_ERR(t);
++		goto err_unlock;
++	}
++	sched_set_fifo_low(t);
++	sb->thread = t;
++	wake_up_process(t);
++
++	enable_irq(sb->irq);
++	sb->streaming = true;
++	dev_info(sb->dev, "streaming started\n");
++	return 0;
++
++err_unlock:
++	spi_bus_unlock(ctlr);
++	pm_runtime_put_autosuspend(ctlr->dev.parent);
++err_off:
++	sb_mcu_off(sb);
++	return ret;
++}
++
++/*
++ * Send SHUTDOWN through the transport thread and wait up to 5 s for the ready
++ * line to drop. The caller resets the MCU either way.
++ */
++static void sb_mcu_shutdown(struct sb_dev *sb)
++{
++	unsigned long start = jiffies;
++	unsigned long deadline = start + msecs_to_jiffies(SB_WAKE_TIMEOUT_MS);
++
++	if (READ_ONCE(sb->stream_failed)) {
++		dev_err(sb->dev, "stream failed, skipping SHUTDOWN\n");
++		return;
++	}
++
++	/* driver-internal; replaces any unsent userspace command */
++	atomic_set(&sb->cmd_pending, SB_CMD_SHUTDOWN);
++	wake_up(&sb->thread_wq);
++
++	for (;;) {
++		/* only judge the ready line once SHUTDOWN has been sent or dropped */
++		if (atomic_read(&sb->cmd_pending) != SB_CMD_SHUTDOWN &&
++		    !sb_mcu_awake(sb)) {
++			dev_info(sb->dev, "MCU asleep after %u ms\n",
++				 jiffies_to_msecs(jiffies - start));
++			return;
++		}
++		if (time_after(jiffies, deadline) || READ_ONCE(sb->stream_failed))
++			break;
++		msleep(SB_WAKE_POLL_MS);
++	}
++	dev_err(sb->dev, "MCU did not go to sleep within %d ms\n",
++		SB_WAKE_TIMEOUT_MS);
++}
++
++static void sb_stream_stop(struct sb_dev *sb)
++{
++	struct spi_controller *ctlr = sb->spi->controller;
++
++	sb_mcu_shutdown(sb);
++
++	disable_irq(sb->irq);
++	if (atomic_read(&sb->irq_storm))
++		enable_irq(sb->irq);	/* undo only the ISR's own disable */
++
++	kthread_stop(sb->thread);
++	sb->thread = NULL;
++	atomic_set(&sb->cmd_pending, SB_CMD_NONE);
++
++	spi_bus_unlock(ctlr);
++	pm_runtime_put_autosuspend(ctlr->dev.parent);
++
++	sb_mcu_off(sb);
++	sb->streaming = false;
++	sb_reset_readers(sb);
++	wake_up_interruptible(&sb->read_wq);
++
++	dev_info(sb->dev,
++		 "streaming stopped: %llu transactions, %llu busy, %llu bad magic, %llu bad checksum, %llu spi errors, %llu overflows, %llu commands%s\n",
++		 sb->st.trans, sb->st.busy, sb->st.bad_magic, sb->st.bad_csum,
++		 sb->st.spi_err, sb->st.overflow, sb->st.cmds_sent,
++		 sb->stream_failed ? " (failed)" : "");
++}
++
++static struct sb_dev *sb_from_file(struct file *f)
++{
++	struct miscdevice *misc = f->private_data;
++
++	return container_of(misc, struct sb_misc, misc)->sb;
++}
++
++static int sb_main_open(struct inode *inode, struct file *f)
++{
++	struct sb_dev *sb = sb_from_file(f);
++	int ret = 0;
++
++	mutex_lock(&sb->state_lock);
++	if (sb->gone) {
++		ret = -ENODEV;
++	} else if (sb->uses_dma && !identity_dma) {
++		dev_err(sb->dev, "frames use SE DMA but identity_dma is not set; refusing\n");
++		ret = -EPERM;
++	} else if (sb->users == 0) {
++		ret = sb_stream_start(sb);
++	}
++	if (!ret)
++		sb->users++;
++	mutex_unlock(&sb->state_lock);
++
++	if (!ret)
++		dev_info(sb->dev, "syncboss opened by %s (%d), client %u\n",
++			 current->comm, task_pid_nr(current), sb->users);
++	return ret;
++}
++
++static int sb_main_release(struct inode *inode, struct file *f)
++{
++	struct sb_dev *sb = sb_from_file(f);
++
++	mutex_lock(&sb->state_lock);
++	if (--sb->users == 0 && sb->streaming)
++		sb_stream_stop(sb);
++	mutex_unlock(&sb->state_lock);
++	return 0;
++}
++
++/*
++ * The only userspace -> MCU path. Exactly one allowlisted packet per call;
++ * anything else is refused with -EPERM. The user buffer is compared against
++ * the table, and only the table entry is ever transmitted.
++ */
++static ssize_t sb_main_write(struct file *f, const char __user *ubuf,
++			     size_t count, loff_t *ppos)
++{
++	struct sb_dev *sb = sb_from_file(f);
++	u8 buf[SB_CMD_LEN];
++	int cmd;
++
++	if (count != SB_CMD_LEN)
++		return -EPERM;
++	if (copy_from_user(buf, ubuf, SB_CMD_LEN))
++		return -EFAULT;
++	cmd = sb_cmd_lookup(buf, count);
++	if (cmd == SB_CMD_NONE) {
++		dev_warn_ratelimited(sb->dev, "refused write %*ph from %s\n",
++				     SB_CMD_LEN, buf, current->comm);
++		return -EPERM;
++	}
++
++	/* syncboss0 is open by this caller, so the stream normally runs */
++	if (READ_ONCE(sb->stream_failed) || !READ_ONCE(sb->streaming))
++		return -EIO;
++	if (atomic_cmpxchg(&sb->cmd_pending, SB_CMD_NONE, cmd) != SB_CMD_NONE)
++		return -EBUSY;
++	wake_up(&sb->thread_wq);
++	return count;
++}
++
++static const struct file_operations sb_main_fops = {
++	.owner		= THIS_MODULE,
++	.open		= sb_main_open,
++	.release	= sb_main_release,
++	.write		= sb_main_write,
++	.llseek		= noop_llseek,
++};
++
++static int sb_reader_open(struct inode *inode, struct file *f)
++{
++	struct miscdevice *misc = f->private_data;
++	struct sb_misc *m = container_of(misc, struct sb_misc, misc);
++	struct sb_dev *sb = m->sb;
++	struct sb_reader *r;
++	int ret;
++
++	r = kzalloc(sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return -ENOMEM;
++	ret = kfifo_alloc(&r->fifo, SB_FIFO_SIZE, GFP_KERNEL);
++	if (ret) {
++		kfree(r);
++		return ret;
++	}
++	r->sb = sb;
++	r->control = (m == &sb->m_control);
++	spin_lock_init(&r->lock);
++
++	spin_lock(&sb->readers_lock);
++	list_add_tail(&r->node, &sb->readers);
++	spin_unlock(&sb->readers_lock);
++
++	f->private_data = r;
++	return stream_open(inode, f);
++}
++
++static int sb_reader_release(struct inode *inode, struct file *f)
++{
++	struct sb_reader *r = f->private_data;
++	struct sb_dev *sb = r->sb;
++
++	spin_lock(&sb->readers_lock);
++	list_del(&r->node);
++	spin_unlock(&sb->readers_lock);
++
++	kfifo_free(&r->fifo);
++	kfree(r);
++	return 0;
++}
++
++static bool sb_reader_has_data(struct sb_reader *r)
++{
++	bool ret;
++
++	spin_lock(&r->lock);
++	ret = !kfifo_is_empty(&r->fifo);
++	spin_unlock(&r->lock);
++	return ret;
++}
++
++/*
++ * stream0: as many whole records as fit; control0: one record per call,
++ * -ENOBUFS if it does not fit.
++ */
++static ssize_t sb_reader_read(struct file *f, char __user *ubuf, size_t count,
++			      loff_t *ppos)
++{
++	struct sb_reader *r = f->private_data;
++	struct sb_dev *sb = r->sb;
++	size_t cap = min_t(size_t, count, SB_FIFO_SIZE);
++	size_t off = 0;
++	u8 *kbuf;
++	int ret;
++
++	if (!count)
++		return 0;
++
++	while (!sb_reader_has_data(r)) {
++		if (f->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		ret = wait_event_interruptible(sb->read_wq,
++					       sb_reader_has_data(r));
++		if (ret)
++			return ret;
++	}
++
++	kbuf = kmalloc(cap, GFP_KERNEL);
++	if (!kbuf)
++		return -ENOMEM;
++
++	spin_lock(&r->lock);
++	while (!kfifo_is_empty(&r->fifo)) {
++		unsigned int len = kfifo_peek_len(&r->fifo);
++
++		if (len > cap - off)
++			break;
++		off += kfifo_out(&r->fifo, kbuf + off, len);
++		if (r->control)
++			break;
++	}
++	spin_unlock(&r->lock);
++
++	if (!off) {
++		kfree(kbuf);
++		return -ENOBUFS;
++	}
++	ret = copy_to_user(ubuf, kbuf, off) ? -EFAULT : off;
++	kfree(kbuf);
++	return ret;
++}
++
++static __poll_t sb_reader_poll(struct file *f, struct poll_table_struct *pt)
++{
++	struct sb_reader *r = f->private_data;
++
++	poll_wait(f, &r->sb->read_wq, pt);
++	return sb_reader_has_data(r) ? EPOLLIN | EPOLLRDNORM : 0;
++}
++
++static const struct file_operations sb_reader_fops = {
++	.owner		= THIS_MODULE,
++	.open		= sb_reader_open,
++	.release	= sb_reader_release,
++	.read		= sb_reader_read,
++	.poll		= sb_reader_poll,
++};
++
++static void sb_free_bufs(void *data)
++{
++	struct sb_dev *sb = data;
++
++	kfree(sb->tx_buf);
++	kfree(sb->rx_buf);
++}
++
++static int sb_register_misc(struct sb_dev *sb, struct sb_misc *m,
++			    const char *name, const struct file_operations *fops)
++{
++	m->sb = sb;
++	m->misc.minor = MISC_DYNAMIC_MINOR;
++	m->misc.name = name;
++	m->misc.fops = fops;
++	m->misc.mode = 0600;
++	m->misc.parent = sb->dev;
++	return misc_register(&m->misc);
++}
++
++static int sb_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct sb_dev *sb;
++	bool dma;
++	int ret, i;
++
++	sb = devm_kzalloc(dev, sizeof(*sb), GFP_KERNEL);
++	if (!sb)
++		return -ENOMEM;
++	sb->spi = spi;
++	sb->dev = dev;
++	mutex_init(&sb->state_lock);
++	init_waitqueue_head(&sb->thread_wq);
++	init_waitqueue_head(&sb->read_wq);
++	spin_lock_init(&sb->readers_lock);
++	INIT_LIST_HEAD(&sb->readers);
++
++	/* hold the MCU in reset from the start */
++	sb->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(sb->reset))
++		return dev_err_probe(dev, PTR_ERR(sb->reset), "reset gpio\n");
++	sb->ready = devm_gpiod_get(dev, "ready", GPIOD_IN);
++	if (IS_ERR(sb->ready))
++		return dev_err_probe(dev, PTR_ERR(sb->ready), "ready gpio\n");
++
++	for (i = 0; i < ARRAY_SIZE(sb_supply_names); i++)
++		sb->supplies[i].supply = sb_supply_names[i];
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(sb->supplies),
++				      sb->supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "supplies\n");
++
++	if ((spi->mode & SPI_MODE_X_MASK) != SPI_MODE_3 ||
++	    spi->max_speed_hz == 0 || spi->max_speed_hz > SB_SPI_MAX_HZ)
++		return dev_err_probe(dev, -EINVAL,
++				     "need SPI mode 3 and <= %d Hz\n",
++				     SB_SPI_MAX_HZ);
++	spi->bits_per_word = 8;
++	ret = spi_setup(spi);
++	if (ret)
++		return dev_err_probe(dev, ret, "spi_setup\n");
++
++	/*
++	 * Frame buffers: one transaction each, cache-line padded, from
++	 * ZONE_DMA (below 4 GiB on this board) so a 32-bit DMA mask on the
++	 * mapping device never needs a bounce buffer.
++	 */
++	sb->tx_buf = kzalloc(SB_BUF_SIZE, GFP_KERNEL | GFP_DMA);
++	sb->rx_buf = kzalloc(SB_BUF_SIZE, GFP_KERNEL | GFP_DMA);
++	ret = devm_add_action_or_reset(dev, sb_free_bufs, sb);
++	if (ret)
++		return ret;
++	if (!sb->tx_buf || !sb->rx_buf)
++		return -ENOMEM;
++
++	sb->xfer.tx_buf = sb->tx_buf;
++	sb->xfer.rx_buf = sb->rx_buf;
++	sb->xfer.len = SB_TRANS_LEN;
++	sb->xfer.bits_per_word = 8;
++	sb->xfer.speed_hz = spi->max_speed_hz;
++	spi_message_init_with_transfers(&sb->msg, &sb->xfer, 1);
++
++	if (spi->irq <= 0)
++		return dev_err_probe(dev, spi->irq ? spi->irq : -EINVAL,
++				     "ready interrupt\n");
++	sb->irq = spi->irq;
++	ret = devm_request_irq(dev, sb->irq, sb_ready_isr, IRQF_NO_AUTOEN,
++			       "syncboss-ready", sb);
++	if (ret)
++		return dev_err_probe(dev, ret, "request ready irq\n");
++
++	/* report which path the controller will take for one frame */
++	dma = spi->controller->can_dma &&
++	      spi->controller->can_dma(spi->controller, spi, &sb->xfer);
++	sb->uses_dma = dma;
++	dev_info(dev, "frame %d bytes at %u Hz, controller %s, %s, identity_dma=%d\n",
++		 SB_TRANS_LEN, spi->max_speed_hz,
++		 dev_name(spi->controller->dev.parent),
++		 dma ? "DMA" : "FIFO", identity_dma);
++
++	spi_set_drvdata(spi, sb);
++
++	ret = sb_register_misc(sb, &sb->m_stream, "syncboss_stream0",
++			       &sb_reader_fops);
++	if (ret)
++		return ret;
++	ret = sb_register_misc(sb, &sb->m_control, "syncboss_control0",
++			       &sb_reader_fops);
++	if (ret)
++		goto err_stream;
++	ret = sb_register_misc(sb, &sb->m_main, "syncboss0", &sb_main_fops);
++	if (ret)
++		goto err_control;
++	return 0;
++
++err_control:
++	misc_deregister(&sb->m_control.misc);
++err_stream:
++	misc_deregister(&sb->m_stream.misc);
++	return ret;
++}
++
++/* Stop streaming for good and leave the MCU held in reset */
++static void sb_quiesce(struct sb_dev *sb)
++{
++	mutex_lock(&sb->state_lock);
++	sb->gone = true;
++	if (sb->streaming)
++		sb_stream_stop(sb);
++	gpiod_set_value_cansleep(sb->reset, 1);
++	mutex_unlock(&sb->state_lock);
++}
++
++static void sb_remove(struct spi_device *spi)
++{
++	struct sb_dev *sb = spi_get_drvdata(spi);
++
++	sb_quiesce(sb);
++	misc_deregister(&sb->m_main.misc);
++	misc_deregister(&sb->m_control.misc);
++	misc_deregister(&sb->m_stream.misc);
++}
++
++static void sb_shutdown(struct spi_device *spi)
++{
++	sb_quiesce(spi_get_drvdata(spi));
++}
++
++static const struct of_device_id sb_of_match[] = {
++	{ .compatible = "oculus,hollywood-syncboss" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sb_of_match);
++
++static const struct spi_device_id sb_spi_ids[] = {
++	{ "hollywood-syncboss" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, sb_spi_ids);
++
++static struct spi_driver sb_driver = {
++	.driver = {
++		.name = "quest2-syncboss",
++		.of_match_table = sb_of_match,
++		.suppress_bind_attrs = true,
++	},
++	.id_table = sb_spi_ids,
++	.probe = sb_probe,
++	.remove = sb_remove,
++	.shutdown = sb_shutdown,
++};
++module_spi_driver(sb_driver);
++
++MODULE_DESCRIPTION("Quest 2 syncboss MCU link (IMU stream subset, no MCU programming)");
++MODULE_LICENSE("GPL");
